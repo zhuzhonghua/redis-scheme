@@ -65,18 +65,18 @@ target_include_directories(scheme_core PUBLIC "${SCHEME_SRC_DIR}")
 # C bridge over the VM (extern "C" API in redis_scheme_runtime.h)
 # ---------------------------------------------------------------------------
 add_library(redis_scheme_runtime STATIC
-    "${MODULE_SRC_DIR}/src/redis_scheme_runtime.cpp")
+    "${MODULE_SRC_DIR}/redis_scheme_runtime.cpp")
 target_include_directories(redis_scheme_runtime PUBLIC
-    "${MODULE_SRC_DIR}/src" "${MODULE_SRC_DIR}/include")
+    "${MODULE_SRC_DIR}")
 target_link_libraries(redis_scheme_runtime PUBLIC scheme_core)
 
 # ---------------------------------------------------------------------------
 # The redis module itself (pure C, dlopen'ed by redis-server)
 # ---------------------------------------------------------------------------
 add_library(redis_scheme_module MODULE
-    "${MODULE_SRC_DIR}/src/redis_scheme_module.c")
+    "${MODULE_SRC_DIR}/redis_scheme_module.c")
 target_include_directories(redis_scheme_module PUBLIC
-    "${MODULE_SRC_DIR}/src" "${MODULE_SRC_DIR}/include")
+    "${MODULE_SRC_DIR}")
 target_link_libraries(redis_scheme_module PRIVATE redis_scheme_runtime)
 
 # the module resolves RM_* at load time from the redis-server process; on
