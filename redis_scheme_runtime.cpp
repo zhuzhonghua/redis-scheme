@@ -165,6 +165,65 @@ redis_scheme_eval(redis_scheme_vm_t *h, const char *script, size_t script_len,
   return 0;
 }
 
+int
+redis_scheme_bind_args(redis_scheme_vm_t *h, RedisModuleString **argv,
+                       int argc, long long numkeys, char *err, int err_cap)
+{
+  if (h == NULL || h->vm == NULL) {
+    return -1;
+  }
+  if (err_cap > 0) {
+    err[0] = '\0';
+  }
+
+  /* The caller (module.c) already validated argc >= 3 + numkeys and
+     numkeys >= 0; only bind the vectors here. */
+  VM *vm = h->vm;
+  try {
+    int nkeys = (int) numkeys;
+    int nargs = argc - 3 - nkeys;
+
+    /* KEYS: vector of the declared keys.  The slot roots the vector across
+       any collection inside scm_make_string/scm_vector_set/scm_set_global. */
+    Sgcvar1(vm, keys_slot);
+    *keys_slot = scm_make_vector(vm, nkeys);
+    for (int i = 0; i < nkeys; i++) {
+      size_t len = 0;
+      const char *p = RedisModule_StringPtrLen(argv[3 + i], &len);
+      scm_vector_set(vm, keys_slot, i, scm_make_string(vm, p, (int) len));
+    }
+    scm_set_global(vm, "KEYS", *keys_slot);
+
+    /* ARGV: vector of the remaining arguments. */
+    Sgcvar1(vm, args_slot);
+    *args_slot = scm_make_vector(vm, nargs);
+    for (int i = 0; i < nargs; i++) {
+      size_t len = 0;
+      const char *p = RedisModule_StringPtrLen(argv[3 + nkeys + i], &len);
+      scm_vector_set(vm, args_slot, i, scm_make_string(vm, p, (int) len));
+    }
+    scm_set_global(vm, "ARGV", *args_slot);
+  }
+  catch (const char *e) {
+    if (err_cap > 0) {
+      const char *msg = (h->errbuf != NULL && h->errbuf[0] != '\0')
+                          ? h->errbuf : (e != NULL ? e : "unknown scheme error");
+      snprintf(err, err_cap, "%s", msg);
+    }
+    return -1;
+  }
+  catch (...) {
+    if (err_cap > 0) {
+      const char *msg = (h->errbuf != NULL && h->errbuf[0] != '\0')
+                          ? h->errbuf : "unknown scheme error";
+      snprintf(err, err_cap, "%s", msg);
+    }
+    return -1;
+  }
+
+  return 0;
+}
+
 void
 redis_scheme_reply(redis_scheme_vm_t *h, RedisModuleCtx *ctx)
 {

@@ -23,15 +23,19 @@ static int scheme_eval_command(RedisModuleCtx *ctx,
         "ERR wrong number of arguments for 'scheme.eval' command");
   }
 
-  /* numkeys must be a non-negative integer; keys/args are not bound to the
-     script yet, but keep the shape of EVAL for forward compatibility. */
+  /* numkeys must be a non-negative integer; keys (argv[3] .. argv[3+nk-1])
+     and args (argv[3+nk] ..) are bound to the KEYS/ARGV globals before
+     evaluation, so at least numkeys arguments must follow the script. */
   long long numkeys = 0;
   if (RedisModule_StringToLongLong(argv[2], &numkeys) != REDISMODULE_OK
       || numkeys < 0) {
     return RedisModule_ReplyWithError(ctx,
         "ERR value is not an integer or out of range");
   }
-  (void) numkeys;
+  if (argc < 3 + numkeys) {
+    return RedisModule_ReplyWithError(ctx,
+        "ERR Number of keys can't be greater than number of args");
+  }
 
   /* Script bytes: argv[1] */
   size_t script_len = 0;
@@ -44,6 +48,12 @@ static int scheme_eval_command(RedisModuleCtx *ctx,
   }
 
   char errbuf[512];
+  if (redis_scheme_bind_args(h, argv, argc, numkeys,
+                             errbuf, sizeof(errbuf)) != 0) {
+    redis_scheme_destroy(h, NULL, 0);
+    return RedisModule_ReplyWithErrorFormat(ctx, "ERR scheme: %s", errbuf);
+  }
+
   if (redis_scheme_eval(h, script, script_len, errbuf, sizeof(errbuf)) != 0) {
     redis_scheme_destroy(h, NULL, 0);
     return RedisModule_ReplyWithErrorFormat(ctx, "ERR scheme: %s", errbuf);
