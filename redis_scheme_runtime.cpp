@@ -63,27 +63,26 @@ redis_scheme_throw_err(redis_scheme_vm_t *h, const char *fmt, ...)
   throw h->errbuf;
 }
 
-/* Build (("tag" . msg)): a one-element list whose head is the pair
-   ("tag" . msg).  The extra list layer marks the value as a tagged reply
-   (an error/status object): an ordinary pair like (cons "err" x) stays a
-   plain return value, while the single-element list form is reserved for
-   replies.  msg must be a string (caller stack slot, rooted); tag is built
-   fresh here and rooted before the next allocation. */
+/* Build the tagged reply value: a hashtable with a single string field
+   "err"/"ok" holding msg -- the Scheme form of an error / status reply
+   object.  msg must be a string (caller stack slot, rooted); the key is
+   built fresh here and rooted before the table set (which may collect). */
 static ValueT
 redis_reply_tagged(VM* vm, ValueT* msg, const char* tag, int tag_len)
 {
-  Sgcvar3(vm, tag_slot, pair_slot, list_slot);
-  *tag_slot = scm_make_string(vm, tag, tag_len);        /* "err" / "ok" */
-  *pair_slot = scm_make_pair(vm, tag_slot, msg);        /* ("tag" . msg) */
-  *list_slot = scm_make_pair(vm, pair_slot, Snullref);  /* (("tag" . msg)) */
-  return *list_slot;
+  Sgcvar3(vm, tbl_slot, key_slot, val_slot);
+  *tbl_slot = scm_make_table(vm);
+  *key_slot = scm_make_string(vm, tag, tag_len);        /* "err" / "ok" */
+  *val_slot = *msg;
+  scm_table_set(vm, tbl_slot, key_slot, *val_slot);
+  return *tbl_slot;
 }
 
 /* redis-error-reply / redis-status-reply: both build a tagged reply value
-   (("err" . "msg")) / (("ok" . "msg")) -- the Scheme form of an error /
-   status reply object.  redis_scheme_reply recognizes the shape and emits a
-   Redis error / status reply; any other value keeps the write-rendering
-   path. */
+   -- a hashtable with a single string field "err"/"ok" holding the message,
+   the Scheme form of an error / status reply object.  redis_scheme_reply
+   recognizes the shape and emits a Redis error / status reply; any other
+   value keeps the write-rendering path. */
 static ValueT
 redis_scheme_stub_error_reply(VM* vm, ValueT* msg)
 {
@@ -288,40 +287,27 @@ redis_scheme_bind_args(redis_scheme_vm_t *h, RedisModuleString **argv,
   return 0;
 }
 
-/* Detect a tagged reply value: (("tag" . "msg")) with tag = the string
-   "err" or "ok" and msg a string.  Returns 1 for an error reply, 2 for a
-   status reply, 0 when the value is anything else (which keeps the
-   write-rendering path).  The shape is matched strictly -- exactly one
-   pair, string payload, string tag -- so ordinary lists and alists are
-   never hijacked.  last is registry-rooted, so the pair structure survives
-   any allocation (the collector does not move objects). */
+/* Detect a tagged reply value: a hashtable whose "err" field is a string
+   (error reply) or whose "ok" field is a string (status reply); "err" is
+   checked first.  Returns 1 for an error reply, 2 for a status reply, 0
+   when the value is anything else (which keeps the write-rendering path).
+   Extra fields do not matter.  last is registry-rooted, so the hashtable
+   survives any allocation. */
 static int
 redis_tagged_reply(VM* vm, ValueT* last)
 {
-  if (!scm_is_pair(vm, last)) {
+  if (!scm_is_table(vm, last)) {
     return 0;
   }
-  ValueT *head = scm_car(vm, last);               /* ("tag" . msg) */
-  if (!scm_is_pair(vm, head) || !scm_is_null(vm, scm_cdr(vm, last))) {
-    return 0;                                     /* not exactly one pair */
-  }
-  ValueT *msg = scm_cdr(vm, head);
-  if (!scm_is_string(vm, msg)) {
-    return 0;
-  }
-  ValueT *tag = scm_car(vm, head);
-  if (!scm_is_string(vm, tag)) {
-    return 0;
-  }
-  int n = 0;
-  const char *s = scm_get_string(vm, tag, &n);
-  if (s == NULL) {
-    return 0;
-  }
-  if (n == 3 && memcmp(s, "err", 3) == 0) {
+  Sgcvar2(vm, key_slot, val_slot);
+  *key_slot = scm_make_string(vm, "err", 3);
+  *val_slot = scm_table_get(vm, last, key_slot);
+  if (scm_is_string(vm, val_slot)) {
     return 1;
   }
-  if (n == 2 && memcmp(s, "ok", 2) == 0) {
+  *key_slot = scm_make_string(vm, "ok", 2);
+  *val_slot = scm_table_get(vm, last, key_slot);
+  if (scm_is_string(vm, val_slot)) {
     return 2;
   }
   return 0;
@@ -332,15 +318,19 @@ redis_scheme_reply(redis_scheme_vm_t *h, RedisModuleCtx *ctx)
 {
   ValueT last = scm_registry_get(h->vm, REDIS_SCHEME_LAST_KEY);
 
-  /* Tagged replies first: (("err" . "msg")) -> error, (("ok" . "msg")) ->
-     status.  RedisModule_ReplyWithError / ReplyWithSimpleString need a
-     NUL-terminated buffer, so copy the payload out of the scheme string
-     first. */
+  /* Tagged replies first: a hashtable field "err" -> error, "ok" -> status.
+     RedisModule_ReplyWithError / ReplyWithSimpleString need a NUL-terminated
+     buffer, so copy the payload out of the scheme string first. */
   int tag = redis_tagged_reply(h->vm, &last);
   if (tag != 0) {
-    ValueT *msg = scm_cdr(h->vm, scm_car(h->vm, &last));
+    /* fetch the payload -- the single "err"/"ok" field (recognized above) */
+    Sgcvar2(h->vm, key_slot, payload_slot);
+    const char *key_name = (tag == 1) ? "err" : "ok";
+    int key_len = (tag == 1) ? 3 : 2;
+    *key_slot = scm_make_string(h->vm, key_name, key_len);
+    *payload_slot = scm_table_ref(h->vm, &last, key_slot);
     int n = 0;
-    const char *s = scm_get_string(h->vm, msg, &n);
+    const char *s = scm_get_string(h->vm, payload_slot, &n);
     std::string body(s != NULL ? s : "", s != NULL ? (size_t) n : 0);
     if (tag == 1) {
       RedisModule_ReplyWithError(ctx, body.c_str());

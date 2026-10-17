@@ -47,3 +47,33 @@ args):
 redis-cli SCHEME.EVAL "(vector-ref KEYS 0)" 1 mykey
 redis-cli SCHEME.EVAL "(vector-ref ARGV 1)" 0 alpha beta
 ```
+
+Error and status replies: a script can return an error / status reply
+instead of a plain value.  Everyday use is two host functions, each
+taking exactly one string argument:
+
+```
+redis-cli SCHEME.EVAL '(redis-error-reply "oops")' 0
+redis-cli SCHEME.EVAL '(redis-status-reply "OK")' 0
+```
+
+`redis-error-reply` makes the client see an error reply (wire `-oops`;
+a message that already starts with `ERR ` is passed through as-is).
+`redis-status-reply` makes it see a status line (`OK`).  Under the hood
+both return a tagged value: a hashtable with a single string field --
+`{"err": "msg"}` for errors, `{"ok": "msg"}` for status.  The
+reply path recognizes exactly this shape (a single string field whose
+key is "err" or "ok", with a string value) and emits the matching Redis
+reply; every other value keeps the plain string rendering.
+
+Because the tagged value is an ordinary Scheme value, a script can also
+build and return it directly instead of calling the host function:
+
+```
+redis-cli SCHEME.EVAL '((lambda (h) (hash-table-set! h "ok" "DONE") h)
+                        (make-hash-table))' 0
+```
+
+This is the same value `(redis-status-reply "DONE")` produces.  Tables
+with more than one field, or with a field other than "err"/"ok", are
+not recognized as replies and render as `#<hash-table>`.
