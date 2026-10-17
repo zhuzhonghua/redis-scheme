@@ -2,17 +2,17 @@
 
 A Redis module that embeds the
 [dummyscheme](https://github.com/zhuzhonghua/dummyscheme) VM.
-It exposes a single command, `SCHEME.EVAL`, shaped like `EVAL`:
+It exposes a single command, `SCHEME.EVAL`, shaped like `EVAL`, so
+Scheme scripts can run Redis commands the way Lua scripts do:
 
 ```
 SCHEME.EVAL script numkeys key [key ...] arg [arg ...]
 ```
 
 The handler evaluates the script in a fresh scheme VM and replies with
-the result converted to a typed Redis reply, matching how a Lua script's
-return value is converted (`luaReplyToRedisReply`).  The key spec is the
-same as `EVAL` (begin_search index pos=2, find_keys keynum firstkey=1
-keystep=1), so key parsing and cluster routing behave like Lua scripts.
+the result converted to a typed Redis reply.  The key spec is the same
+as `EVAL` (begin_search index pos=2, find_keys keynum firstkey=1
+keystep=1), so key parsing and cluster routing follow the same rules.
 
 ## Build
 
@@ -51,13 +51,12 @@ redis-cli SCHEME.EVAL "(vector-ref ARGV 1)" 0 alpha beta
 
 ## Replies
 
-The script's return value is converted to a Redis reply the same way a
-Lua script's return value is:
+The script's return value is converted to a typed Redis reply:
 
 | Scheme value | Redis reply |
 |---|---|
 | integer | integer (e.g. `42`) |
-| float | integer (truncated, like Lua numbers) |
+| float | integer (truncated) |
 | string | bulk string |
 | `#t` | integer `1` |
 | `#f` | null |
@@ -66,7 +65,38 @@ Lua script's return value is:
 
 Examples: `(list 1 2 3)` replies with a three-element array; `(list "a" 1
 #t)` replies `["a", 1, 1]`; `'()` replies with an empty array; `(sqrt 2)`
-replies `1` (floats truncate, as Lua numbers do).
+replies `1` (floats truncate).
+
+## Calling Redis commands
+
+A script runs Redis commands through `redis-call` / `redis-pcall`.
+The first argument is the command name, the rest are its arguments: strings pass through, integers
+and floats are converted to their decimal text:
+
+```
+redis-cli SCHEME.EVAL '(redis-call "SET" "mykey" "hello")' 0
+redis-cli SCHEME.EVAL '(redis-call "INCR" "counter")' 0
+redis-cli SCHEME.EVAL '(begin (redis-call "SET" "f" 1.5) (redis-call "GET" "f"))' 0
+```
+
+The reply is converted back to a scheme value: bulk string -> string,
+integer -> int, double -> float, bool -> `#t`/`#f`, null -> `#f` (falsy,
+so `(if (redis-call "GET" k) ...)` works), array/set -> vector, map ->
+hashtable, big number / verbatim -> string.
+
+`redis-call` aborts the script when the command returns an error;
+`redis-pcall` returns a `{"err": "..."}` table instead so the script can
+continue:
+
+```
+redis-cli SCHEME.EVAL '(redis-pcall "NOSUCHCMD" "x")' 0   # error reply
+redis-cli SCHEME.EVAL '(begin (redis-pcall "NOSUCHCMD" "x") "ok")' 0
+```
+
+A `{err=...}` value returned as the final result is emitted as an error
+reply, the same tagged-value path described below.  Commands flagged
+`deny-script` are rejected in script mode, so `redis-call "SCHEME.EVAL"
+...` fails.
 
 Error and status replies: a script can return an error / status reply
 instead of a plain value.  Everyday use is two host functions, each
