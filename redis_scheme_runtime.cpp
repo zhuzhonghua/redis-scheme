@@ -12,6 +12,9 @@
 #include <string.h>
 #include <stdarg.h>
 #include <string>
+#include <vector>
+#include <charconv>
+#include <climits>
 
 using namespace Scheme;
 
@@ -78,6 +81,16 @@ redis_reply_tagged(VM* vm, ValueT* msg, const char* tag, int tag_len)
   return *tbl_slot;
 }
 
+/* Build a {err=...} table from a C string, the shared error shape of
+   redis-error-reply and redis-pcall's error return. */
+static ValueT
+redis_scheme_err_table(VM* vm, const char* msg, int len)
+{
+  Sgcvar1(vm, slot);
+  *slot = scm_make_string(vm, msg != NULL ? msg : "", len);
+  return redis_reply_tagged(vm, slot, "err", 3);
+}
+
 /* redis-error-reply / redis-status-reply: both build a tagged reply value
    -- a hashtable with a single string field "err"/"ok" holding the message,
    the Scheme form of an error / status reply object.  redis_scheme_reply
@@ -90,7 +103,9 @@ redis_scheme_stub_error_reply(VM* vm, ValueT* msg)
     redis_scheme_throw_err(redis_scheme_get_ctx(vm),
         "redis-error-reply: expected string, got %s", scm_typename(vm, msg));
   }
-  return redis_reply_tagged(vm, msg, "err", 3);
+  int len = 0;
+  const char *s = scm_get_string(vm, msg, &len);
+  return redis_scheme_err_table(vm, s, len);
 }
 
 static ValueT
@@ -103,10 +118,255 @@ redis_scheme_stub_status_reply(VM* vm, ValueT* msg)
   return redis_reply_tagged(vm, msg, "ok", 2);
 }
 
+/* Shortest round-trip text of a double, matching the number-to-string
+   conversion used for script arguments: an integer-valued double within
+   long-long range prints as an integer (so 1e15 -> "1000000000000000",
+   never "1e+15"), everything else uses the shortest decimal that parses
+   back to the same double (so 0.1 -> "0.1", not "0.10000000000000001"). */
+static std::string
+redis_scheme_ftoa(double d)
+{
+  if (d >= (double)(-LLONG_MAX / 2) && d <= (double)(LLONG_MAX / 2)) {
+    long long ll = (long long)d;
+    if (ll == d) {
+      char buf[32];
+      int n = snprintf(buf, sizeof(buf), "%lld", ll);
+      return std::string(buf, (size_t)n);
+    }
+  }
+  char buf[64];
+  auto res = std::to_chars(buf, buf + sizeof(buf), d);
+  return std::string(buf, res.ptr);
+}
+
+/* Convert a scheme value into a RedisModuleString command argument.
+   Strings pass through; ints and floats render as decimal text.  Returns a
+   string the caller must free, or throws via the error channel. */
+static RedisModuleString *
+redis_scheme_arg_to_string(redis_scheme_vm_t *h, ValueT *slot)
+{
+  RedisModuleCtx *ctx = h->ctx;
+  if (scm_is_string(h->vm, slot)) {
+    int n = 0;
+    const char *s = scm_get_string(h->vm, slot, &n);
+    return RedisModule_CreateString(ctx, s != NULL ? s : "", (size_t) n);
+  }
+  if (scm_is_int(h->vm, slot)) {
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%lld",
+                     (long long) scm_get_int(h->vm, slot));
+    return RedisModule_CreateString(ctx, buf, (size_t) n);
+  }
+  if (scm_is_float(h->vm, slot)) {
+    std::string s = redis_scheme_ftoa(scm_get_float(h->vm, slot));
+    return RedisModule_CreateString(ctx, s.data(), s.size());
+  }
+  redis_scheme_throw_err(h, "redis-call: expected string or number, got %s",
+                         scm_typename(h->vm, slot));
+  return NULL; /* unreachable */
+}
+
+/* Convert a RedisModuleCallReply into a scheme value.  Error replies throw
+   (the message is filled into h->errbuf) so redis-call aborts; redis-pcall
+   catches and wraps them.  The caller stores the returned value into a
+   rooted slot before the next allocation. */
+static ValueT
+redis_scheme_parse_reply(redis_scheme_vm_t *h, RedisModuleCallReply *reply)
+{
+  VM *vm = h->vm;
+  switch (RedisModule_CallReplyType(reply)) {
+  case REDISMODULE_REPLY_STRING: {
+    size_t len = 0;
+    const char *s = RedisModule_CallReplyStringPtr(reply, &len);
+    Sgcvar1(vm, str);
+    *str = scm_make_string(vm, s != NULL ? s : "", (int) len);
+    return *str;
+  }
+  case REDISMODULE_REPLY_BIG_NUMBER: {
+    size_t len = 0;
+    const char *s = RedisModule_CallReplyBigNumber(reply, &len);
+    Sgcvar1(vm, str);
+    *str = scm_make_string(vm, s != NULL ? s : "", (int) len);
+    return *str;
+  }
+  case REDISMODULE_REPLY_VERBATIM_STRING: {
+    size_t len = 0;
+    const char *format = NULL;
+    const char *s = RedisModule_CallReplyVerbatim(reply, &len, &format);
+    Sgcvar1(vm, str);
+    *str = scm_make_string(vm, s != NULL ? s : "", (int) len);
+    return *str;
+  }
+  case REDISMODULE_REPLY_INTEGER: {
+    Sgcvar1(vm, i);
+    *i = scm_make_int(vm, (scm_int) RedisModule_CallReplyInteger(reply));
+    return *i;
+  }
+  case REDISMODULE_REPLY_DOUBLE: {
+    Sgcvar1(vm, f);
+    *f = scm_make_float(vm, RedisModule_CallReplyDouble(reply));
+    return *f;
+  }
+  case REDISMODULE_REPLY_BOOL: {
+    Sgcvar1(vm, b);
+    *b = scm_make_bool(vm, RedisModule_CallReplyBool(reply) != 0);
+    return *b;
+  }
+  case REDISMODULE_REPLY_NULL:
+    /* null replies map to #f: falsy like Lua's nil (scripts test with
+       (if ...)), and returning it produces a null reply -- the same round
+       trip as Lua's nil. */
+    {
+      Sgcvar1(vm, b);
+      *b = scm_make_bool(vm, false);
+      return *b;
+    }
+  case REDISMODULE_REPLY_ERROR: {
+    size_t len = 0;
+    const char *s = RedisModule_CallReplyStringPtr(reply, &len);
+    redis_scheme_throw_err(h, "%.*s", (int) len, s != NULL ? s : "command error");
+    return scm_make_bool(vm, false); /* unreachable */
+  }
+  case REDISMODULE_REPLY_ARRAY:
+  case REDISMODULE_REPLY_SET: {
+    size_t n = RedisModule_CallReplyLength(reply);
+    Sgcvar1(vm, vec);
+    *vec = scm_make_vector(vm, (int) n);
+    Sgcvar1(vm, elem);
+    for (size_t i = 0; i < n; i++) {
+      RedisModuleCallReply *sub = RedisModule_CallReplyArrayElement(reply, i);
+      *elem = redis_scheme_parse_reply(h, sub);
+      scm_vector_set(vm, vec, (int) i, *elem);
+    }
+    return *vec;
+  }
+  case REDISMODULE_REPLY_MAP: {
+    size_t n = RedisModule_CallReplyLength(reply);
+    Sgcvar1(vm, tbl);
+    *tbl = scm_make_table(vm);
+    Sgcvar2(vm, key, val);
+    for (size_t i = 0; i < n; i++) {
+      RedisModuleCallReply *rk = NULL, *rv = NULL;
+      RedisModule_CallReplyMapElement(reply, i, &rk, &rv);
+      *key = redis_scheme_parse_reply(h, rk);
+      *val = redis_scheme_parse_reply(h, rv);
+      scm_table_set(vm, tbl, key, *val);
+    }
+    return *tbl;
+  }
+  default:
+    redis_scheme_throw_err(h, "redis-call: unsupported reply type %d",
+                           (int) RedisModule_CallReplyType(reply));
+    return scm_make_bool(vm, false); /* unreachable */
+  }
+}
+
+/* redis-call / redis-pcall: run a Redis command from inside the script.
+   The first argument is the command name (a string); the rest are its
+   arguments (strings, ints and floats, converted to bulk strings).  The
+   reply comes back as a scheme value: bulk string -> string, integer ->
+   int, double -> float, bool -> #t/#f, null -> #f, array/set -> vector,
+   map -> hashtable, big number / verbatim -> string.  redis-call aborts the
+   script on an error reply; redis-pcall returns a {err=...} table instead.
+   raise selects that error behavior. */
+static ValueT
+redis_scheme_do_call(VM *vm, ValueT *rest, bool raise)
+{
+  redis_scheme_vm_t *h = redis_scheme_get_ctx(vm);
+
+  if (scm_is_null(vm, rest)) {
+    redis_scheme_throw_err(h,
+        "redis-call: please specify at least one argument");
+  }
+  ValueT *cmd_slot = scm_car(vm, rest);
+  if (!scm_is_string(vm, cmd_slot)) {
+    redis_scheme_throw_err(h,
+        "redis-call: command name must be a string, got %s",
+        scm_typename(vm, cmd_slot));
+  }
+  int cmd_len = 0;
+  const char *cmd = scm_get_string(vm, cmd_slot, &cmd_len);
+  std::string cmdname(cmd != NULL ? cmd : "", cmd != NULL ? (size_t) cmd_len : 0);
+
+  /* The remaining arguments, converted to bulk strings. */
+  std::vector<RedisModuleString *> args;
+  ValueT *p = scm_cdr(vm, rest);
+  for (;;) {
+    if (scm_is_null(vm, p)) {
+      break;
+    }
+    args.push_back(redis_scheme_arg_to_string(h, scm_car(vm, p)));
+    p = scm_cdr(vm, p);
+  }
+
+  /* Free the argument strings once the call has consumed them ("v" only
+     borrows a reference), also on the throw path. */
+  struct ArgsGuard {
+    RedisModuleCtx *ctx;
+    std::vector<RedisModuleString *> *args;
+    ~ArgsGuard() {
+      for (size_t i = 0; i < args->size(); i++) {
+        RedisModule_FreeString(ctx, (*args)[i]);
+      }
+    }
+  } args_guard = { h->ctx, &args };
+
+  /* "vSE": v = the args vector, S = script mode (reject deny-script
+     commands), E = dispatch failures come back as error replies instead of
+     NULL + errno, so both kinds of failure look alike. */
+  RedisModuleCallReply *reply = RedisModule_Call(h->ctx, cmdname.c_str(),
+                                                 "vSE", args.data(),
+                                                 args.size());
+  if (reply == NULL) {
+    redis_scheme_throw_err(h, "redis-call: command '%s' failed",
+                           cmdname.c_str());
+  }
+
+  struct ReplyGuard {
+    RedisModuleCallReply *reply;
+    ~ReplyGuard() {
+      if (reply != NULL) {
+        RedisModule_FreeCallReply(reply);
+      }
+    }
+  } reply_guard = { reply };
+
+  Sgcvar1(vm, out);
+  try {
+    *out = redis_scheme_parse_reply(h, reply);
+  }
+  catch (...) {
+    if (!raise) {
+      /* redis-pcall: turn the error message into a {err=...} table, the
+         same shape redis-error-reply builds. */
+      const char *m = (h->errbuf != NULL && h->errbuf[0] != '\0')
+                        ? h->errbuf : "command error";
+      *out = redis_scheme_err_table(vm, m, (int) strlen(m));
+    } else {
+      throw; /* redis-call: abort the script with the command error */
+    }
+  }
+  return *out;
+}
+
+static ValueT
+redis_scheme_stub_call(VM* vm, ValueT* rest)
+{
+  return redis_scheme_do_call(vm, rest, true);
+}
+
+static ValueT
+redis_scheme_stub_pcall(VM* vm, ValueT* rest)
+{
+  return redis_scheme_do_call(vm, rest, false);
+}
+
 /* Registration table; keep the (NULL, -1) sentinel last. */
 static const RegCProc redis_scheme_lib[] = {
   RegCProc("redis-error-reply", redis_scheme_stub_error_reply),
   RegCProc("redis-status-reply", redis_scheme_stub_status_reply),
+  RegCProc("redis-call", redis_scheme_stub_call, true),
+  RegCProc("redis-pcall", redis_scheme_stub_pcall, true),
   RegCProc(NULL, -1)               /* end sentinel */
 };
 
@@ -137,8 +397,24 @@ redis_scheme_fill_err(redis_scheme_vm_t *h, const char *e, char *err, int err_ca
   }
 }
 
+/* Allocator handed to the host VM, so every scheme object lives in Redis
+   memory (zmalloc, counted by INFO memory and OOM-checked), the same
+   arrangement as Lua.  ScmAlloc follows lua_Alloc's shape: nsize==0 frees,
+   otherwise (re)allocates. */
+static void *
+redis_scheme_alloc(void *ud, void *ptr, size_t osize, size_t nsize)
+{
+  (void)ud;
+  (void)osize;
+  if (nsize == 0) {
+    RedisModule_Free(ptr);
+    return NULL;
+  }
+  return RedisModule_Realloc(ptr, nsize);
+}
+
 redis_scheme_vm_t *
-redis_scheme_create(void)
+redis_scheme_create(RedisModuleCtx *ctx)
 {
   redis_scheme_vm_t *h = (redis_scheme_vm_t *) malloc(sizeof(*h));
   if (h == NULL) {
@@ -146,12 +422,12 @@ redis_scheme_create(void)
   }
 
   h->vm = NULL;
-  h->ctx = NULL;
+  h->ctx = ctx;
   h->errbuf = NULL;
   h->errcap = 0;
 
   try {
-    h->vm = scm_create_vm();
+    h->vm = scm_create_vm(redis_scheme_alloc, NULL);
     if (h->vm == NULL) {
       free(h);
       return NULL;

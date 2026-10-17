@@ -41,8 +41,9 @@ static int scheme_eval_command(RedisModuleCtx *ctx,
   size_t script_len = 0;
   const char *script = RedisModule_StringPtrLen(argv[1], &script_len);
 
-  /* Create a fresh scheme VM for this command. */
-  redis_scheme_vm_t *h = redis_scheme_create();
+  /* Create a fresh scheme VM for this command; it remembers ctx for
+     redis-call / redis-pcall and allocates through the Redis allocator. */
+  redis_scheme_vm_t *h = redis_scheme_create(ctx);
   if (h == NULL) {
     return RedisModule_ReplyWithError(ctx, "ERR scheme: cannot create VM");
   }
@@ -104,9 +105,11 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv,
       .key_specs = kspecs,
   };
 
-  /* No fixed-position keys: firstkey=0 lastkey=0 keystep=0. */
+  /* No fixed-position keys: firstkey=0 lastkey=0 keystep=0.  deny-script
+     keeps scripts from calling scheme.eval again (script mode in
+     redis-call rejects it), like EVAL's NOSCRIPT flag. */
   if (RedisModule_CreateCommand(ctx, "scheme.eval", scheme_eval_command,
-                                "write deny-oom", 0, 0, 0)
+                                "write deny-oom deny-script", 0, 0, 0)
       == REDISMODULE_ERR) {
     RedisModule_Log(ctx, "warning", "could not create command scheme.eval");
     return REDISMODULE_ERR;

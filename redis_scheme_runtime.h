@@ -18,9 +18,11 @@ extern "C" {
 typedef struct redis_scheme_vm_s redis_scheme_vm_t;
 
 /*
- * Create a VM.  Returns NULL on failure; the handle is non-NULL on success.
+ * Create a VM bound to the current command ctx.  The VM's memory goes
+ * through the Redis allocator (zmalloc), like Lua's.  Returns NULL on
+ * failure; the handle is non-NULL on success.
  */
-redis_scheme_vm_t *redis_scheme_create(void);
+redis_scheme_vm_t *redis_scheme_create(RedisModuleCtx *ctx);
 
 /*
  * Destroy a VM created by redis_scheme_create.  Returns 0 on success, -1 on
