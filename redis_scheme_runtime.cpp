@@ -125,6 +125,19 @@ static void redis_registry_set(VM* vm, const char* name, ValueT v)
   scm_registry_set(vm, name, *slot);
 }
 
+/* Translate an exception into the module error contract: fill err with the
+   message, preferring h->errbuf (set by redis_scheme_throw_err) over the
+   thrown string.  The caller returns -1 after calling this. */
+static void
+redis_scheme_fill_err(redis_scheme_vm_t *h, const char *e, char *err, int err_cap)
+{
+  if (err_cap > 0) {
+    const char *msg = (h->errbuf != NULL && h->errbuf[0] != '\0')
+                        ? h->errbuf : (e != NULL ? e : "unknown scheme error");
+    snprintf(err, err_cap, "%s", msg);
+  }
+}
+
 redis_scheme_vm_t *
 redis_scheme_create(void)
 {
@@ -218,22 +231,13 @@ redis_scheme_eval(redis_scheme_vm_t *h, const char *script, size_t script_len,
     redis_registry_set(h->vm, REDIS_SCHEME_LAST_KEY, res);
   }
   catch (const char *e) {
-    if (err_cap > 0) {
-      const char *msg = (h->errbuf != NULL && h->errbuf[0] != '\0')
-                          ? h->errbuf : (e != NULL ? e : "unknown scheme error");
-      snprintf(err, err_cap, "%s", msg);
-    }
+    redis_scheme_fill_err(h, e, err, err_cap);
     return -1;
   }
   catch (...) {
-    if (err_cap > 0) {
-      const char *msg = (h->errbuf != NULL && h->errbuf[0] != '\0')
-                          ? h->errbuf : "unknown scheme error";
-      snprintf(err, err_cap, "%s", msg);
-    }
+    redis_scheme_fill_err(h, NULL, err, err_cap);
     return -1;
   }
-
   return 0;
 }
 
@@ -274,22 +278,13 @@ redis_scheme_bind_args(redis_scheme_vm_t *h, RedisModuleString **argv,
     scm_set_global(vm, "ARGV", *args_slot);
   }
   catch (const char *e) {
-    if (err_cap > 0) {
-      const char *msg = (h->errbuf != NULL && h->errbuf[0] != '\0')
-                          ? h->errbuf : (e != NULL ? e : "unknown scheme error");
-      snprintf(err, err_cap, "%s", msg);
-    }
+    redis_scheme_fill_err(h, e, err, err_cap);
     return -1;
   }
   catch (...) {
-    if (err_cap > 0) {
-      const char *msg = (h->errbuf != NULL && h->errbuf[0] != '\0')
-                          ? h->errbuf : "unknown scheme error";
-      snprintf(err, err_cap, "%s", msg);
-    }
+    redis_scheme_fill_err(h, NULL, err, err_cap);
     return -1;
   }
-
   return 0;
 }
 
