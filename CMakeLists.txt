@@ -2,7 +2,8 @@
 # redis module for the dummyscheme VM -- distribution CMake build.
 #
 # Builds only scheme_module.so (the module + the embedded scheme core).  No
-# redis source is needed: the module API header is vendored in include/.
+# redis source is needed: the module API header (redismodule.h) is vendored at
+# the repo root.
 #
 #   cmake -S . -B build
 #   cmake --build build
