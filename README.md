@@ -9,9 +9,10 @@ SCHEME.EVAL script numkeys key [key ...] arg [arg ...]
 ```
 
 The handler evaluates the script in a fresh scheme VM and replies with
-the result rendered as a string.  The key spec is the same as `EVAL`
-(begin_search index pos=2, find_keys keynum firstkey=1 keystep=1), so
-key parsing and cluster routing behave like Lua scripts.
+the result converted to a typed Redis reply, matching how a Lua script's
+return value is converted (`luaReplyToRedisReply`).  The key spec is the
+same as `EVAL` (begin_search index pos=2, find_keys keynum firstkey=1
+keystep=1), so key parsing and cluster routing behave like Lua scripts.
 
 ## Build
 
@@ -47,6 +48,25 @@ args):
 redis-cli SCHEME.EVAL "(vector-ref KEYS 0)" 1 mykey
 redis-cli SCHEME.EVAL "(vector-ref ARGV 1)" 0 alpha beta
 ```
+
+## Replies
+
+The script's return value is converted to a Redis reply the same way a
+Lua script's return value is:
+
+| Scheme value | Redis reply |
+|---|---|
+| integer | integer (e.g. `42`) |
+| float | integer (truncated, like Lua numbers) |
+| string | bulk string |
+| `#t` | integer `1` |
+| `#f` | null |
+| proper list / vector | array, elements converted recursively |
+| anything else (symbol, char, plain hashtable, dotted pair, ...) | bulk string of the write rendering |
+
+Examples: `(list 1 2 3)` replies with a three-element array; `(list "a" 1
+#t)` replies `["a", 1, 1]`; `'()` replies with an empty array; `(sqrt 2)`
+replies `1` (floats truncate, as Lua numbers do).
 
 Error and status replies: a script can return an error / status reply
 instead of a plain value.  Everyday use is two host functions, each

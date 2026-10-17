@@ -46,7 +46,11 @@ int redis_scheme_eval(redis_scheme_vm_t *h, const char *script,
 int redis_scheme_bind_args(redis_scheme_vm_t *h, RedisModuleString **argv,
                            int argc, long long numkeys, char *err, int err_cap);
 
-/* Reply to ctx with the value of the last eval, rendered as a bulk string. */
+/* Reply to ctx with the value of the last eval.  Values are converted to
+   typed Redis replies: int/float -> integer, string -> bulk, proper
+   list/vector -> array (recursive), #t -> 1, #f -> null, {err}/{ok} tables
+   -> error/status; any other value keeps the write-rendering (bulk string)
+   path. */
 void redis_scheme_reply(redis_scheme_vm_t *h, RedisModuleCtx *ctx);
 
 #ifdef __cplusplus

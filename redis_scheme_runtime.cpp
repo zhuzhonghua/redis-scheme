@@ -313,6 +313,76 @@ redis_tagged_reply(VM* vm, ValueT* last)
   return 0;
 }
 
+/* Convert one scheme value into a Redis reply: numbers (int and float)
+   reply as integers, strings as bulk, #t as integer 1, #f as null, proper
+   lists and vectors as arrays with the elements converted recursively.
+   Anything else (plain hashtables, symbols, chars, dotted pairs, ...) keeps
+   the write-rendering path.  slot must be rooted for the duration of the
+   call (the recursion allocates, which may collect). */
+static void
+redis_scheme_reply_value(VM *vm, ValueT *slot, RedisModuleCtx *ctx)
+{
+  if (scm_is_int(vm, slot)) {
+    RedisModule_ReplyWithLongLong(ctx, (long long) scm_get_int(vm, slot));
+    return;
+  }
+  if (scm_is_float(vm, slot)) {
+    /* floats reply as long long, truncated */
+    RedisModule_ReplyWithLongLong(ctx, (long long) scm_get_float(vm, slot));
+    return;
+  }
+  if (scm_is_string(vm, slot)) {
+    int n = 0;
+    const char *s = scm_get_string(vm, slot, &n);
+    RedisModule_ReplyWithStringBuffer(ctx, s, (size_t) n);
+    return;
+  }
+  if (scm_is_true(vm, slot)) {
+    RedisModule_ReplyWithLongLong(ctx, 1);
+    return;
+  }
+  if (scm_is_false(vm, slot)) {
+    RedisModule_ReplyWithNull(ctx);
+    return;
+  }
+  if (scm_is_list(vm, slot)) {
+    /* scm_is_list counts any pair, so the length check doubles as the
+       proper-list test: scm_proper_list_len returns -1 for a dotted pair,
+       which keeps the write-rendering path below (scm_list_len would
+       throw). */
+    int len = scm_proper_list_len(vm, slot);
+    if (len >= 0) {
+      RedisModule_ReplyWithArray(ctx, len);
+      for (int i = 0; i < len; i++) {
+        /* element slot lives inside the rooted list and stays valid across
+           the recursive conversion's allocations */
+        redis_scheme_reply_value(vm, scm_list_ref(vm, slot, i), ctx);
+      }
+      return;
+    }
+  } else if (scm_is_vector(vm, slot)) {
+    int len = scm_vector_len(vm, slot);
+    RedisModule_ReplyWithArray(ctx, len);
+    Sgcvar1(vm, elem);
+    for (int i = 0; i < len; i++) {
+      *elem = scm_vector_ref(vm, slot, i);
+      redis_scheme_reply_value(vm, elem, ctx);
+    }
+    return;
+  }
+
+  /* Fallback: write-rendering (plain hashtables, symbols, chars, ...).  The
+     pointer is only valid until the next scm_tostring call; consume it
+     synchronously. */
+  int n = 0;
+  const char *s = scm_tostring(vm, slot, &n);
+  if (s == NULL) {
+    RedisModule_ReplyWithNull(ctx);
+    return;
+  }
+  RedisModule_ReplyWithStringBuffer(ctx, s, (size_t) n);
+}
+
 void
 redis_scheme_reply(redis_scheme_vm_t *h, RedisModuleCtx *ctx)
 {
@@ -340,23 +410,15 @@ redis_scheme_reply(redis_scheme_vm_t *h, RedisModuleCtx *ctx)
     return;
   }
 
-  /* Render the value with write semantics (strings come out quoted; proper
-     type conversion replaces this later).  Copy immediately: the pointer is
-     only valid until the next scm_tostring call. */
-  int n = 0;
-  const char *s = NULL;
+  /* Typed conversion (numbers/strings/bools/lists/vectors); anything else is
+     write-rendered inside.  last is registry-rooted, so the value survives
+     the allocations of the conversion. */
   try {
-    s = scm_tostring(h->vm, &last, &n);
+    redis_scheme_reply_value(h->vm, &last, ctx);
   }
   catch (...) {
     const char *msg = (h->errbuf != NULL && h->errbuf[0] != '\0')
                         ? h->errbuf : "cannot render scheme value";
     RedisModule_ReplyWithErrorFormat(ctx, "ERR scheme: %s", msg);
-    return;
   }
-  if (s == NULL) {
-    RedisModule_ReplyWithNull(ctx);
-    return;
-  }
-  RedisModule_ReplyWithStringBuffer(ctx, s, (size_t) n);
 }
