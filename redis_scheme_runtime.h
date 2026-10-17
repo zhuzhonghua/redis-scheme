@@ -17,10 +17,15 @@ extern "C" {
 /* Opaque handle to one scheme VM. */
 typedef struct redis_scheme_vm_s redis_scheme_vm_t;
 
-/* Create a VM.  Returns NULL on failure. */
+/*
+ * Create a VM.  Returns NULL on failure; the handle is non-NULL on success.
+ */
 redis_scheme_vm_t *redis_scheme_create(void);
 
-/* Destroy a VM.  Returns 0 on success, -1 on failure (error in err). */
+/*
+ * Destroy a VM created by redis_scheme_create.  Returns 0 on success, -1 on
+ * failure (error in err).
+ */
 int redis_scheme_destroy(redis_scheme_vm_t *h, char *err, int err_cap);
 
 /*

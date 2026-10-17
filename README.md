@@ -38,3 +38,12 @@ redis-cli SCHEME.EVAL "(+ 40 2)" 0
 ```
 
 Returns `42`.
+
+Keys and args are bound to the `KEYS` / `ARGV` globals as 0-based
+vectors (like `EVAL`, the `numkeys` keys follow the script, then the
+args):
+
+```
+redis-cli SCHEME.EVAL "(vector-ref KEYS 0)" 1 mykey
+redis-cli SCHEME.EVAL "(vector-ref ARGV 1)" 0 alpha beta
+```

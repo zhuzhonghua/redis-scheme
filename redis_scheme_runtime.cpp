@@ -87,11 +87,9 @@ redis_scheme_create(void)
 int
 redis_scheme_destroy(redis_scheme_vm_t *h, char *err, int err_cap)
 {
+  /* h is always a non-NULL handle from redis_scheme_create. */
   if (err_cap > 0) {
     err[0] = '\0';
-  }
-  if (h == NULL) {
-    return 0;
   }
 
   if (h->vm != NULL) {
@@ -126,9 +124,6 @@ int
 redis_scheme_eval(redis_scheme_vm_t *h, const char *script, size_t script_len,
                   char *err, int err_cap)
 {
-  if (h == NULL || h->vm == NULL) {
-    return -1;
-  }
   if (err_cap > 0) {
     err[0] = '\0';
   }
@@ -169,9 +164,6 @@ int
 redis_scheme_bind_args(redis_scheme_vm_t *h, RedisModuleString **argv,
                        int argc, long long numkeys, char *err, int err_cap)
 {
-  if (h == NULL || h->vm == NULL) {
-    return -1;
-  }
   if (err_cap > 0) {
     err[0] = '\0';
   }
@@ -227,10 +219,6 @@ redis_scheme_bind_args(redis_scheme_vm_t *h, RedisModuleString **argv,
 void
 redis_scheme_reply(redis_scheme_vm_t *h, RedisModuleCtx *ctx)
 {
-  if (h == NULL || h->vm == NULL || ctx == NULL) {
-    return;  /* the caller already replied with an error; nothing to do */
-  }
-
   ValueT last = scm_registry_get(h->vm, REDIS_SCHEME_LAST_KEY);
 
   /* Render the value with write semantics (strings come out quoted; proper
