@@ -131,3 +131,16 @@ redis-cli SCHEME.EVAL '((lambda (h) (hash-table-set! h "ok" "DONE") h)
 This is the same value `(redis-status-reply "DONE")` produces.  Tables
 with more than one field, or with a field other than "err"/"ok", are
 not recognized as replies and render as `#<hash-table>`.
+
+## Hashing
+
+`redis-sha1hex` returns the SHA-1 digest (RFC 3174) of one argument as
+40 lowercase hex characters.  Strings hash their bytes; integers and
+floats hash their decimal text form:
+
+```
+redis-cli SCHEME.EVAL '(redis-sha1hex "abc")' 0
+```
+
+Returns `a9993e364706816aba3e25717850c26c9cd0d89d`.  Passing any other
+type is an error.

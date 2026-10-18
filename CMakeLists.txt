@@ -2,8 +2,8 @@
 # redis module for the dummyscheme VM -- distribution CMake build.
 #
 # Builds only scheme_module.so (the module + the embedded scheme core).  No
-# redis source is needed: the module API header (redismodule.h) is vendored at
-# the repo root.
+# redis source is needed: the module API header (redismodule.h) and the SHA-1
+# digest (sha1.c/sha1.h) are vendored at the repo root.
 #
 #   cmake -S . -B build
 #   cmake --build build
@@ -66,7 +66,8 @@ target_include_directories(scheme_core PUBLIC "${SCHEME_SRC_DIR}")
 # C bridge over the VM (extern "C" API in redis_scheme_runtime.h)
 # ---------------------------------------------------------------------------
 add_library(redis_scheme_runtime STATIC
-    "${MODULE_SRC_DIR}/redis_scheme_runtime.cpp")
+    "${MODULE_SRC_DIR}/redis_scheme_runtime.cpp"
+    "${MODULE_SRC_DIR}/sha1.c")
 target_include_directories(redis_scheme_runtime PUBLIC
     "${MODULE_SRC_DIR}")
 target_link_libraries(redis_scheme_runtime PUBLIC scheme_core)

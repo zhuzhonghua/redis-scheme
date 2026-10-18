@@ -7,6 +7,10 @@
 #include "vm.h"
 #include "redis_scheme_runtime.h"
 
+extern "C" {
+#include "sha1.h"  /* vendored from redis: SHA-1 digest (RFC 3174) */
+}
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -363,12 +367,59 @@ redis_scheme_stub_pcall(VM* vm, ValueT* rest)
   return redis_scheme_do_call(vm, rest, false);
 }
 
+/* redis-sha1hex: the SHA-1 digest of one argument as 40 lowercase hex
+   characters.  Strings hash their bytes; ints and floats hash their
+   decimal text form; any other type is an error. */
+static ValueT
+redis_scheme_stub_sha1hex(VM* vm, ValueT* arg)
+{
+  const char *data = NULL;
+  int len = 0;
+  std::string numtext;
+  if (scm_is_string(vm, arg)) {
+    data = scm_get_string(vm, arg, &len);
+  } else if (scm_is_int(vm, arg)) {
+    char buf[32];
+    len = snprintf(buf, sizeof(buf), "%lld",
+                   (long long) scm_get_int(vm, arg));
+    numtext.assign(buf, (size_t) len);
+    data = numtext.data();
+  } else if (scm_is_float(vm, arg)) {
+    numtext = redis_scheme_ftoa(scm_get_float(vm, arg));
+    data = numtext.data();
+    len = (int) numtext.size();
+  } else {
+    redis_scheme_throw_err(redis_scheme_get_ctx(vm),
+        "redis-sha1hex: expected string or number, got %s",
+        scm_typename(vm, arg));
+    return scm_make_bool(vm, false); /* unreachable */
+  }
+
+  SHA1_CTX ctx;
+  unsigned char digest[20];
+  SHA1Init(&ctx);
+  SHA1Update(&ctx, (const unsigned char *) (data != NULL ? data : ""),
+             (uint32_t) len);
+  SHA1Final(digest, &ctx);
+
+  static const char hexdig[] = "0123456789abcdef";
+  char hex[40];
+  for (int i = 0; i < 20; i++) {
+    hex[2 * i] = hexdig[digest[i] >> 4];
+    hex[2 * i + 1] = hexdig[digest[i] & 0x0f];
+  }
+  Sgcvar1(vm, slot);
+  *slot = scm_make_string(vm, hex, 40);
+  return *slot;
+}
+
 /* Registration table; keep the (NULL, -1) sentinel last. */
 static const RegCProc redis_scheme_lib[] = {
   RegCProc("redis-error-reply", redis_scheme_stub_error_reply),
   RegCProc("redis-status-reply", redis_scheme_stub_status_reply),
   RegCProc("redis-call", redis_scheme_stub_call, true),
   RegCProc("redis-pcall", redis_scheme_stub_pcall, true),
+  RegCProc("redis-sha1hex", redis_scheme_stub_sha1hex),
   RegCProc(NULL, -1)               /* end sentinel */
 };
 
