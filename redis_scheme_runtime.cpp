@@ -16,6 +16,8 @@ extern "C" {
 #include <string.h>
 #include <stdarg.h>
 #include <string>
+#include <list>
+#include <unordered_map>
 #include <vector>
 #include <charconv>
 #include <climits>
@@ -367,6 +369,25 @@ redis_scheme_stub_pcall(VM* vm, ValueT* rest)
   return redis_scheme_do_call(vm, rest, false);
 }
 
+/* SHA-1 of a buffer as 40 lowercase hex chars + NUL, shared by the
+   redis-sha1hex stub and the script cache. */
+static void
+redis_scheme_sha1hex_buf(const char *data, size_t len, char out[41])
+{
+  SHA1_CTX ctx;
+  unsigned char digest[20];
+  SHA1Init(&ctx);
+  SHA1Update(&ctx, (const unsigned char *) data, (uint32_t) len);
+  SHA1Final(digest, &ctx);
+
+  static const char hexdig[] = "0123456789abcdef";
+  for (int i = 0; i < 20; i++) {
+    out[2 * i] = hexdig[digest[i] >> 4];
+    out[2 * i + 1] = hexdig[digest[i] & 0x0f];
+  }
+  out[40] = '\0';
+}
+
 /* redis-sha1hex: the SHA-1 digest of one argument as 40 lowercase hex
    characters.  Strings hash their bytes; ints and floats hash their
    decimal text form; any other type is an error. */
@@ -395,22 +416,140 @@ redis_scheme_stub_sha1hex(VM* vm, ValueT* arg)
     return scm_make_bool(vm, false); /* unreachable */
   }
 
-  SHA1_CTX ctx;
-  unsigned char digest[20];
-  SHA1Init(&ctx);
-  SHA1Update(&ctx, (const unsigned char *) (data != NULL ? data : ""),
-             (uint32_t) len);
-  SHA1Final(digest, &ctx);
-
-  static const char hexdig[] = "0123456789abcdef";
-  char hex[40];
-  for (int i = 0; i < 20; i++) {
-    hex[2 * i] = hexdig[digest[i] >> 4];
-    hex[2 * i + 1] = hexdig[digest[i] & 0x0f];
-  }
+  char hex[41];
+  redis_scheme_sha1hex_buf(data != NULL ? data : "", (size_t) len, hex);
   Sgcvar1(vm, slot);
   *slot = scm_make_string(vm, hex, 40);
   return *slot;
+}
+
+/* Script cache: sha1 hex -> script body, process-lifetime (dropped on
+   restart).  Single-threaded command execution, no locking.
+   Eviction: only EVAL-sourced entries are evictable, least-recently-used
+   first, when their count reaches REDIS_SCHEME_SCRIPT_LRU_MAX; LOAD-sourced
+   entries are never evicted. */
+#define REDIS_SCHEME_SCRIPT_LRU_MAX 500
+
+struct redis_scheme_cache_entry {
+  std::string body;
+  int evictable;                         /* EVAL-sourced entries only */
+  std::list<std::string>::iterator lru;  /* valid only when evictable */
+};
+
+typedef std::unordered_map<std::string, redis_scheme_cache_entry>
+    redis_scheme_script_cache_t;
+
+static redis_scheme_script_cache_t redis_scheme_script_cache;
+static std::list<std::string> redis_scheme_script_lru; /* front = least used */
+
+/* Move an evictable entry to the most-recently-used end. */
+static void
+redis_scheme_cache_touch(redis_scheme_script_cache_t::iterator it)
+{
+  if (!it->second.evictable) return;
+  redis_scheme_script_lru.erase(it->second.lru);
+  redis_scheme_script_lru.push_back(it->first);
+  it->second.lru = --redis_scheme_script_lru.end();
+}
+
+void
+redis_scheme_cache_script(const char *body, size_t body_len, char out_sha1[41],
+                          int evictable)
+{
+  redis_scheme_sha1hex_buf(body, body_len, out_sha1);
+  redis_scheme_script_cache_t::iterator it =
+      redis_scheme_script_cache.find(out_sha1);
+  if (it != redis_scheme_script_cache.end()) {
+    redis_scheme_cache_touch(it);
+    return;
+  }
+  if (evictable) {
+    while (redis_scheme_script_lru.size() >= REDIS_SCHEME_SCRIPT_LRU_MAX) {
+      redis_scheme_script_cache.erase(redis_scheme_script_lru.front());
+      redis_scheme_script_lru.pop_front();
+    }
+  }
+  redis_scheme_cache_entry &e = redis_scheme_script_cache[out_sha1];
+  e.body.assign(body, body_len);
+  e.evictable = evictable;
+  if (evictable) {
+    redis_scheme_script_lru.push_back(out_sha1);
+    e.lru = --redis_scheme_script_lru.end();
+  }
+}
+
+int
+redis_scheme_cache_has(const char *sha1hex)
+{
+  return redis_scheme_script_cache.count(sha1hex) != 0;
+}
+
+void
+redis_scheme_cache_flush(void)
+{
+  redis_scheme_script_cache.clear();
+  redis_scheme_script_lru.clear();
+}
+
+/* Bind KEYS/ARGV, evaluate, reply, destroy.  The reply and the error
+   handling are the SCHEME.EVAL flow verbatim. */
+static int
+redis_scheme_run_body(RedisModuleCtx *ctx, const char *body, size_t body_len,
+                      RedisModuleString **argv, int argc, long long numkeys)
+{
+  redis_scheme_vm_t *h = redis_scheme_create(ctx);
+  if (h == NULL) {
+    RedisModule_ReplyWithError(ctx, "ERR scheme: cannot create VM");
+    return -1;
+  }
+
+  char errbuf[512];
+  if (redis_scheme_bind_args(h, argv, argc, numkeys,
+                             errbuf, sizeof(errbuf)) != 0) {
+    redis_scheme_destroy(h, NULL, 0);
+    RedisModule_ReplyWithErrorFormat(ctx, "ERR scheme: %s", errbuf);
+    return -1;
+  }
+
+  if (redis_scheme_eval(h, body, body_len, errbuf, sizeof(errbuf)) != 0) {
+    redis_scheme_destroy(h, NULL, 0);
+    RedisModule_ReplyWithErrorFormat(ctx, "ERR scheme: %s", errbuf);
+    return -1;
+  }
+
+  redis_scheme_reply(h, ctx);
+  redis_scheme_destroy(h, NULL, 0);
+  return 0;
+}
+
+int
+redis_scheme_run(RedisModuleCtx *ctx, const char *body, size_t body_len,
+                 RedisModuleString **argv, int argc, long long numkeys)
+{
+  /* The script enters the cache (evictable, LRU) before it runs. */
+  char sha1[41];
+  redis_scheme_cache_script(body, body_len, sha1, 1);
+  return redis_scheme_run_body(ctx, body, body_len, argv, argc, numkeys);
+}
+
+int
+redis_scheme_run_cached(RedisModuleCtx *ctx, const char *sha1hex,
+                        RedisModuleString **argv, int argc, long long numkeys)
+{
+  redis_scheme_script_cache_t::iterator it =
+      redis_scheme_script_cache.find(sha1hex);
+  if (it == redis_scheme_script_cache.end()) {
+    RedisModule_ReplyWithError(ctx,
+        "NOSCRIPT no matching script; use SCHEME.EVAL");
+    return -1;
+  }
+  /* Safe against invalidation: nothing clears the cache while a script
+     runs (SCHEME.SCRIPT / SCHEME.EVALSHA are deny-script for calls from
+     inside a script). */
+  redis_scheme_cache_touch(it);
+  const std::string &body = it->second.body;
+  return redis_scheme_run_body(ctx, body.data(), body.size(),
+                               argv, argc, numkeys);
 }
 
 /* Registration table; keep the (NULL, -1) sentinel last. */

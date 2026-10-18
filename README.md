@@ -2,11 +2,13 @@
 
 A Redis module that embeds the
 [dummyscheme](https://github.com/zhuzhonghua/dummyscheme) VM.
-It exposes a single command, `SCHEME.EVAL`, shaped like `EVAL`, so
-Scheme scripts can run Redis commands the way Lua scripts do:
+It exposes a script engine shaped like the `EVAL` family, so Scheme
+scripts can run Redis commands the way Lua scripts do:
 
 ```
 SCHEME.EVAL script numkeys key [key ...] arg [arg ...]
+SCHEME.EVALSHA sha1 numkeys key [key ...] arg [arg ...]
+SCHEME.SCRIPT LOAD body | EXISTS sha1 [sha1 ...] | FLUSH
 ```
 
 The handler evaluates the script in a fresh scheme VM and replies with
@@ -131,6 +133,35 @@ redis-cli SCHEME.EVAL '((lambda (h) (hash-table-set! h "ok" "DONE") h)
 This is the same value `(redis-status-reply "DONE")` produces.  Tables
 with more than one field, or with a field other than "err"/"ok", are
 not recognized as replies and render as `#<hash-table>`.
+
+## Script cache
+
+`SCHEME.EVAL` stores every script it runs in a server-side cache keyed by
+its sha1 hex.  `SCHEME.SCRIPT` manages that cache and `SCHEME.EVALSHA`
+runs a cached script by digest:
+
+```
+redis-cli SCHEME.SCRIPT LOAD '(+ 1 2)'            # -> the 40-char sha1 hex
+redis-cli SCHEME.SCRIPT EXISTS <sha1>             # -> 1 / 0 per entry
+redis-cli SCHEME.EVALSHA <sha1> 0                 # -> 3
+redis-cli SCHEME.SCRIPT FLUSH                     # -> OK
+```
+
+- `SCHEME.EVALSHA` has the same argument shape as `SCHEME.EVAL` (digest
+  first), and writes issued from the cached script propagate to replicas
+  and AOF the same way.  A miss replies
+  `NOSCRIPT no matching script; use SCHEME.EVAL`.
+- The digest is the same 40-char lowercase hex `redis-sha1hex` computes;
+  it is case-sensitive, and the cache lives in process memory only, so it
+  is dropped on restart.
+- The cache is node-local: `SCHEME.SCRIPT LOAD` and `FLUSH` are not
+  propagated, so a replica's cache holds only what ran on that replica.
+  After a failover a digest may miss — reply `NOSCRIPT`, then retry with
+  `SCHEME.EVAL`, which re-caches the script on the new master.
+- Entries cached by `SCHEME.EVAL` are evicted least-recently-used first
+  once their count reaches 500; entries added by `SCHEME.SCRIPT LOAD`
+  are never evicted.  Scripts cannot call `SCHEME.SCRIPT` /
+  `SCHEME.EVALSHA` themselves.
 
 ## Hashing
 

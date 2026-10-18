@@ -55,6 +55,42 @@ int redis_scheme_bind_args(redis_scheme_vm_t *h, RedisModuleString **argv,
    path. */
 void redis_scheme_reply(redis_scheme_vm_t *h, RedisModuleCtx *ctx);
 
+/* Script cache: the server-side sha1 hex -> body store behind
+   SCHEME.EVAL / SCHEME.EVALSHA / SCHEME.SCRIPT, in process memory only
+   (dropped on restart, like the script cache). */
+
+/* Store body in the cache under its sha1 hex and write that hex as 41
+   bytes (40 chars + NUL) to out_sha1.  evictable != 0 marks an EVAL-sourced
+   entry (LRU-evicted past 500 entries); LOAD-sourced entries pass 0 and
+   are never evicted. */
+void redis_scheme_cache_script(const char *body, size_t body_len,
+                               char out_sha1[41], int evictable);
+
+/* 1 when sha1hex is in the cache, else 0. */
+int redis_scheme_cache_has(const char *sha1hex);
+
+/* Drop every cached script. */
+void redis_scheme_cache_flush(void);
+
+/*
+ * Run body end-to-end on a fresh VM: bind KEYS/ARGV from argv (the EVAL
+ * shape: argv[3] .. argv[3+numkeys-1] keys, the rest args), evaluate,
+ * reply to ctx, destroy the VM.  The script enters the cache under its
+ * sha1 hex first.  Returns 0 on success, -1 on failure (the error reply
+ * has already been written to ctx).
+ */
+int redis_scheme_run(RedisModuleCtx *ctx, const char *body, size_t body_len,
+                     RedisModuleString **argv, int argc, long long numkeys);
+
+/*
+ * Like redis_scheme_run, but the body comes from the cache (sha1 hex
+ * lookup).  On a miss writes a NOSCRIPT error reply to ctx.  Returns 0 on
+ * success (hit), -1 on miss or failure.
+ */
+int redis_scheme_run_cached(RedisModuleCtx *ctx, const char *sha1hex,
+                            RedisModuleString **argv, int argc,
+                            long long numkeys);
+
 #ifdef __cplusplus
 }
 #endif

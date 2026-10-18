@@ -2,8 +2,9 @@
  * redis_scheme_module.c -- Redis module for dummyscheme.
  *
  *
- * The handler creates a fresh scheme VM, evaluates the script, replies with
- * the result as a string, then destroys the VM.
+ * SCHEME.EVAL / SCHEME.EVALSHA run a scheme script on a fresh VM (the
+ * execution flow lives in redis_scheme_runtime), SCHEME.SCRIPT manages the
+ * server-side script cache.  The result is replied as a typed value.
  *
  */
 #include <stdio.h>
@@ -12,62 +13,238 @@
 #include "redis_scheme_runtime.h"
 
 /* ---------------------------------------------------------------------------
- * SCHEME.EVAL handler
+ * EVAL command handlers
  * ------------------------------------------------------------------------ */
 
+/* Validate the argument shape shared by SCHEME.EVAL and SCHEME.EVALSHA:
+ * script-or-sha1 numkeys key [key ...] arg [...].  numkeys must be a
+ * non-negative integer and argv must hold at least 3 + numkeys entries,
+ * because argv[3] .. argv[3+numkeys-1] are the keys bound to the KEYS
+ * global before evaluation.  On a bad shape the error reply is written
+ * and -1 is returned.  cmdname appears verbatim in the arity error. */
+static int parse_eval_shape(RedisModuleCtx *ctx, const char *cmdname,
+                            RedisModuleString **argv, int argc,
+                            long long *numkeys)
+{
+  if (argc < 3) {
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+             "ERR wrong number of arguments for '%s' command", cmdname);
+    RedisModule_ReplyWithError(ctx, msg);
+    return -1;
+  }
+
+  if (RedisModule_StringToLongLong(argv[2], numkeys) != REDISMODULE_OK
+      || *numkeys < 0) {
+    RedisModule_ReplyWithError(ctx,
+        "ERR value is not an integer or out of range");
+    return -1;
+  }
+  if (argc < 3 + *numkeys) {
+    RedisModule_ReplyWithError(ctx,
+        "ERR Number of keys can't be greater than number of args");
+    return -1;
+  }
+  return 0;
+}
+
+/* SCHEME.EVAL script numkeys key [key ...] arg [...] */
 static int scheme_eval_command(RedisModuleCtx *ctx,
                                RedisModuleString **argv, int argc)
 {
-  if (argc < 3) {
-    return RedisModule_ReplyWithError(ctx,
-        "ERR wrong number of arguments for 'scheme.eval' command");
-  }
-
-  /* numkeys must be a non-negative integer; keys (argv[3] .. argv[3+nk-1])
-     and args (argv[3+nk] ..) are bound to the KEYS/ARGV globals before
-     evaluation, so at least numkeys arguments must follow the script. */
   long long numkeys = 0;
-  if (RedisModule_StringToLongLong(argv[2], &numkeys) != REDISMODULE_OK
-      || numkeys < 0) {
-    return RedisModule_ReplyWithError(ctx,
-        "ERR value is not an integer or out of range");
-  }
-  if (argc < 3 + numkeys) {
-    return RedisModule_ReplyWithError(ctx,
-        "ERR Number of keys can't be greater than number of args");
+  if (parse_eval_shape(ctx, "scheme.eval", argv, argc, &numkeys) != 0) {
+    return REDISMODULE_ERR;
   }
 
-  /* Script bytes: argv[1] */
+  /* Script bytes: argv[1].  redis_scheme_run stores the script in the
+     cache (sha1 hex -> body) before running it. */
   size_t script_len = 0;
   const char *script = RedisModule_StringPtrLen(argv[1], &script_len);
+  redis_scheme_run(ctx, script, script_len, argv, argc, numkeys);
+  return REDISMODULE_OK;
+}
 
-  /* Create a fresh scheme VM for this command; it remembers ctx for
-     redis-call / redis-pcall and allocates through the Redis allocator. */
-  redis_scheme_vm_t *h = redis_scheme_create(ctx);
-  if (h == NULL) {
-    return RedisModule_ReplyWithError(ctx, "ERR scheme: cannot create VM");
+/* SCHEME.EVALSHA sha1 numkeys key [key ...] arg [...] */
+static int scheme_evalsha_command(RedisModuleCtx *ctx,
+                                  RedisModuleString **argv, int argc)
+{
+  long long numkeys = 0;
+  if (parse_eval_shape(ctx, "scheme.evalsha", argv, argc, &numkeys) != 0) {
+    return REDISMODULE_ERR;
   }
 
-  char errbuf[512];
-  if (redis_scheme_bind_args(h, argv, argc, numkeys,
-                             errbuf, sizeof(errbuf)) != 0) {
-    redis_scheme_destroy(h, NULL, 0);
-    return RedisModule_ReplyWithErrorFormat(ctx, "ERR scheme: %s", errbuf);
-  }
-
-  if (redis_scheme_eval(h, script, script_len, errbuf, sizeof(errbuf)) != 0) {
-    redis_scheme_destroy(h, NULL, 0);
-    return RedisModule_ReplyWithErrorFormat(ctx, "ERR scheme: %s", errbuf);
-  }
-
-  redis_scheme_reply(h, ctx);
-  redis_scheme_destroy(h, NULL, 0);
+  /* sha1 hex: argv[1].  A miss replies NOSCRIPT, as with EVALSHA. */
+  size_t sha1_len = 0;
+  const char *sha1 = RedisModule_StringPtrLen(argv[1], &sha1_len);
+  redis_scheme_run_cached(ctx, sha1, argv, argc, numkeys);
   return REDISMODULE_OK;
 }
 
 /* ---------------------------------------------------------------------------
- * Module entry point
+ * SCHEME.SCRIPT subcommands
  * ------------------------------------------------------------------------ */
+
+/* SCHEME.SCRIPT LOAD body -> bulk sha1 */
+static int script_load_command(RedisModuleCtx *ctx,
+                               RedisModuleString **argv, int argc)
+{
+  if (argc != 3) {
+    return RedisModule_ReplyWithError(ctx,
+        "ERR wrong number of arguments for 'scheme.script|load' command");
+  }
+  size_t body_len = 0;
+  const char *body = RedisModule_StringPtrLen(argv[2], &body_len);
+  char sha1[41];
+  /* evictable=0: LOAD-sourced entries are never evicted.  The cache is
+     node-local, so LOAD is not propagated to replicas. */
+  redis_scheme_cache_script(body, body_len, sha1, 0);
+  return RedisModule_ReplyWithStringBuffer(ctx, sha1, 40);
+}
+
+/* SCHEME.SCRIPT EXISTS sha1 [sha1 ...] -> array of 1/0 */
+static int script_exists_command(RedisModuleCtx *ctx,
+                                 RedisModuleString **argv, int argc)
+{
+  if (argc < 3) {
+    return RedisModule_ReplyWithError(ctx,
+        "ERR wrong number of arguments for 'scheme.script|exists' command");
+  }
+  RedisModule_ReplyWithArray(ctx, argc - 2);
+  for (int i = 2; i < argc; i++) {
+    size_t sha1_len = 0;
+    const char *sha1 = RedisModule_StringPtrLen(argv[i], &sha1_len);
+    RedisModule_ReplyWithLongLong(ctx, redis_scheme_cache_has(sha1));
+  }
+  return REDISMODULE_OK;
+}
+
+/* SCHEME.SCRIPT FLUSH -> OK */
+static int script_flush_command(RedisModuleCtx *ctx,
+                                RedisModuleString **argv, int argc)
+{
+  if (argc != 2) {
+    return RedisModule_ReplyWithError(ctx,
+        "ERR wrong number of arguments for 'scheme.script|flush' command");
+  }
+  redis_scheme_cache_flush();
+  return RedisModule_ReplyWithSimpleString(ctx, "OK");
+}
+
+static int scheme_script_command(RedisModuleCtx *ctx,
+                                 RedisModuleString **argv, int argc)
+{
+  if (argc < 2) {
+    return RedisModule_ReplyWithError(ctx,
+        "ERR wrong number of arguments for 'scheme.script' command");
+  }
+
+  size_t sub_len = 0;
+  const char *sub = RedisModule_StringPtrLen(argv[1], &sub_len);
+
+  if (sub_len == 4 && strncasecmp(sub, "load", 4) == 0) {
+    return script_load_command(ctx, argv, argc);
+  }
+  if (sub_len == 6 && strncasecmp(sub, "exists", 6) == 0) {
+    return script_exists_command(ctx, argv, argc);
+  }
+  if (sub_len == 5 && strncasecmp(sub, "flush", 5) == 0) {
+    return script_flush_command(ctx, argv, argc);
+  }
+  return RedisModule_ReplyWithError(ctx,
+      "ERR unknown subcommand for 'scheme.script'");
+}
+
+/* ---------------------------------------------------------------------------
+ * Command registration
+ * ------------------------------------------------------------------------ */
+
+/* Key spec for SCHEME.EVAL / SCHEME.EVALSHA, same shape as EVAL: script
+   numkeys key [key ...] arg [...].  Search starts at argv[2] (numkeys),
+   the key count is read there, and the keys begin at argv[3] with a step
+   of 1.  Flags are the conservative RW/ACCESS/UPDATE, as in EVAL.  The
+   array ends with a zeroed sentinel (begin_search_type = BS_INVALID). */
+static RedisModuleCommandKeySpec scheme_eval_key_specs[] = {
+    {
+        .begin_search_type = REDISMODULE_KSPEC_BS_INDEX,
+        .bs.index.pos = 2,
+        .find_keys_type = REDISMODULE_KSPEC_FK_KEYNUM,
+        .fk.keynum.keynumidx = 0,
+        .fk.keynum.firstkey = 1,
+        .fk.keynum.keystep = 1,
+        .flags = REDISMODULE_CMD_KEY_RW | REDISMODULE_CMD_KEY_ACCESS
+                 | REDISMODULE_CMD_KEY_UPDATE,
+    },
+    { 0 },
+};
+
+static int register_eval_command(RedisModuleCtx *ctx)
+{
+  if (RedisModule_CreateCommand(ctx, "scheme.eval", scheme_eval_command,
+                                "write deny-oom deny-script", 0, 0, 0)
+      == REDISMODULE_ERR) {
+    RedisModule_Log(ctx, "warning", "could not create command scheme.eval");
+    return REDISMODULE_ERR;
+  }
+
+  RedisModuleCommandInfo info = {
+      .version = REDISMODULE_COMMAND_INFO_VERSION,
+      .summary = "Run a scheme script",
+      .arity = -3,
+      .key_specs = scheme_eval_key_specs,
+  };
+  RedisModuleCommand *cmd = RedisModule_GetCommand(ctx, "scheme.eval");
+  if (cmd == NULL
+      || RedisModule_SetCommandInfo(cmd, &info) == REDISMODULE_ERR) {
+    RedisModule_Log(ctx, "warning",
+        "could not set command info for scheme.eval");
+    return REDISMODULE_ERR;
+  }
+  return REDISMODULE_OK;
+}
+
+static int register_evalsha_command(RedisModuleCtx *ctx)
+{
+  if (RedisModule_CreateCommand(ctx, "scheme.evalsha", scheme_evalsha_command,
+                                "write deny-oom deny-script", 0, 0, 0)
+      == REDISMODULE_ERR) {
+    RedisModule_Log(ctx, "warning",
+        "could not create command scheme.evalsha");
+    return REDISMODULE_ERR;
+  }
+
+  RedisModuleCommandInfo info = {
+      .version = REDISMODULE_COMMAND_INFO_VERSION,
+      .summary = "Run a cached scheme script by its sha1 hex",
+      .arity = -3,
+      .key_specs = scheme_eval_key_specs,
+  };
+  RedisModuleCommand *cmd = RedisModule_GetCommand(ctx, "scheme.evalsha");
+  if (cmd == NULL
+      || RedisModule_SetCommandInfo(cmd, &info) == REDISMODULE_ERR) {
+    RedisModule_Log(ctx, "warning",
+        "could not set command info for scheme.evalsha");
+    return REDISMODULE_ERR;
+  }
+  return REDISMODULE_OK;
+}
+
+static int register_script_command(RedisModuleCtx *ctx)
+{
+  /* deny-script keeps scripts from calling scheme.script / scheme.evalsha
+     again, like EVAL's NOSCRIPT flag.  Not a keyspace write: the script
+     cache is node-local and LOAD / FLUSH are not propagated, hence no
+     write flag.  allow-stale permits running on a replica whose master
+     link is down. */
+  if (RedisModule_CreateCommand(ctx, "scheme.script", scheme_script_command,
+                                "deny-script allow-stale", 0, 0, 0)
+      == REDISMODULE_ERR) {
+    RedisModule_Log(ctx, "warning",
+        "could not create command scheme.script");
+    return REDISMODULE_ERR;
+  }
+  return REDISMODULE_OK;
+}
 
 int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv,
                        int argc)
@@ -80,48 +257,10 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv,
     return REDISMODULE_ERR;
   }
 
-  /* Key spec, same shape as EVAL: script numkeys key [key ...] arg [...]
-     Search starts at argv[2] (numkeys), the key count is read there, and
-     the keys begin at argv[3] with a step of 1.  Flags are the conservative
-     RW/ACCESS/UPDATE, as in EVAL.  The array ends with a zeroed sentinel
-     (begin_search_type = BS_INVALID). */
-  RedisModuleCommandKeySpec kspecs[] = {
-      {
-          .begin_search_type = REDISMODULE_KSPEC_BS_INDEX,
-          .bs.index.pos = 2,
-          .find_keys_type = REDISMODULE_KSPEC_FK_KEYNUM,
-          .fk.keynum.keynumidx = 0,
-          .fk.keynum.firstkey = 1,
-          .fk.keynum.keystep = 1,
-          .flags = REDISMODULE_CMD_KEY_RW | REDISMODULE_CMD_KEY_ACCESS
-                   | REDISMODULE_CMD_KEY_UPDATE,
-      },
-      { 0 },
-  };
-  RedisModuleCommandInfo info = {
-      .version = REDISMODULE_COMMAND_INFO_VERSION,
-      .summary = "Run a scheme script",
-      .arity = -3,
-      .key_specs = kspecs,
-  };
-
-  /* No fixed-position keys: firstkey=0 lastkey=0 keystep=0.  deny-script
-     keeps scripts from calling scheme.eval again (script mode in
-     redis-call rejects it), like EVAL's NOSCRIPT flag. */
-  if (RedisModule_CreateCommand(ctx, "scheme.eval", scheme_eval_command,
-                                "write deny-oom deny-script", 0, 0, 0)
-      == REDISMODULE_ERR) {
-    RedisModule_Log(ctx, "warning", "could not create command scheme.eval");
+  if (register_eval_command(ctx) == REDISMODULE_ERR
+      || register_evalsha_command(ctx) == REDISMODULE_ERR
+      || register_script_command(ctx) == REDISMODULE_ERR) {
     return REDISMODULE_ERR;
   }
-
-  RedisModuleCommand *cmd = RedisModule_GetCommand(ctx, "scheme.eval");
-  if (cmd == NULL
-      || RedisModule_SetCommandInfo(cmd, &info) == REDISMODULE_ERR) {
-    RedisModule_Log(ctx, "warning",
-        "could not set command info for scheme.eval");
-    return REDISMODULE_ERR;
-  }
-
   return REDISMODULE_OK;
 }
