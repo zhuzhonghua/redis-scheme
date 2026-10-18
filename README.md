@@ -84,6 +84,10 @@ integer -> int, double -> float, bool -> `#t`/`#f`, null -> `#f` (falsy,
 so `(if (redis-call "GET" k) ...)` works), array/set -> vector, map ->
 hashtable, big number / verbatim -> string.
 
+Write commands a script issues are propagated to AOF / replicas (the
+`!` replicate flag on the module call), so replicas replay the writes,
+not the script.
+
 `redis-call` aborts the script when the command returns an error;
 `redis-pcall` returns a `{"err": "..."}` table instead so the script can
 continue:

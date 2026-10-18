@@ -311,11 +311,13 @@ redis_scheme_do_call(VM *vm, ValueT *rest, bool raise)
     }
   } args_guard = { h->ctx, &args };
 
-  /* "vSE": v = the args vector, S = script mode (reject deny-script
-     commands), E = dispatch failures come back as error replies instead of
-     NULL + errno, so both kinds of failure look alike. */
+  /* "v!SE": v = the args vector, ! = replicate (propagate write commands
+     to AOF / replicas, like EVAL's effect replication), S = script mode
+     (reject deny-script commands), E = dispatch failures come back as
+     error replies instead of NULL + errno, so both kinds of failure look
+     alike. */
   RedisModuleCallReply *reply = RedisModule_Call(h->ctx, cmdname.c_str(),
-                                                 "vSE", args.data(),
+                                                 "v!SE", args.data(),
                                                  args.size());
   if (reply == NULL) {
     redis_scheme_throw_err(h, "redis-call: command '%s' failed",
