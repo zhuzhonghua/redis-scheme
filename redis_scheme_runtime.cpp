@@ -33,6 +33,16 @@ using namespace Scheme;
  * "~script:<sha1hex>" (40 hex chars). */
 #define REDIS_SCHEME_SCRIPT_KEY_PREFIX "~script:"
 
+/* Log levels for redis-log, matching Redis server.h's LL_DEBUG..LL_WARNING
+ * (0..3).  These are the values exposed to scripts as redis-log-* constants
+ * and used for input validation. */
+enum {
+  REDIS_SCHEME_LOG_DEBUG = 0,
+  REDIS_SCHEME_LOG_VERBOSE = 1,
+  REDIS_SCHEME_LOG_NOTICE = 2,
+  REDIS_SCHEME_LOG_WARNING = 3
+};
+
 struct redis_scheme_vm_s {
   VM *vm;               /* interpreter (created once by runtime_init) */
   RedisModuleCtx *ctx;  /* ctx of the current command (set before apply) */
@@ -429,6 +439,64 @@ redis_scheme_stub_sha1hex(VM* vm, ValueT* arg)
   return *slot;
 }
 
+/* redis-log: write a message to the Redis log.  Usage:
+ *   (redis-log LEVEL FRAG ...)
+ * LEVEL is one of the redis-log-debug/verbose/notice/warning constants.
+ * Remaining fragments are joined with spaces; only strings and numbers
+ * contribute, other types are skipped. */
+static ValueT
+redis_scheme_stub_log(VM* vm, ValueT* rest)
+{
+  redis_scheme_vm_t *h = redis_scheme_get_ctx(vm);
+  if (scm_is_null(vm, rest)) {
+    redis_scheme_throw_err(h,
+        "redis-log: expected level followed by message fragments");
+  }
+  ValueT *level_slot = scm_car(vm, rest);
+  if (!scm_is_int(vm, level_slot)) {
+    redis_scheme_throw_err(h,
+        "redis-log: level must be an integer, got %s",
+        scm_typename(vm, level_slot));
+  }
+  int lvl = (int) scm_get_int(vm, level_slot);
+  if (lvl < REDIS_SCHEME_LOG_DEBUG || lvl > REDIS_SCHEME_LOG_WARNING) {
+    redis_scheme_throw_err(h,
+        "redis-log: invalid level %d (expected %d-%d: debug/verbose/notice/warning)",
+        lvl, REDIS_SCHEME_LOG_DEBUG, REDIS_SCHEME_LOG_WARNING);
+  }
+
+  /* Render each fragment and join with spaces.  Only strings and numbers
+     contribute; other types are skipped. */
+  std::string msg;
+  bool first = true;
+  for (ValueT *p = scm_cdr(vm, rest); !scm_is_null(vm, p); p = scm_cdr(vm, p)) {
+    ValueT *item = scm_car(vm, p);
+    std::string frag;
+    if (scm_is_string(vm, item)) {
+      int n = 0;
+      const char *s = scm_get_string(vm, item, &n);
+      frag.assign(s != NULL ? s : "", (size_t) n);
+    } else if (scm_is_int(vm, item)) {
+      char tmp[32];
+      int n = snprintf(tmp, sizeof(tmp), "%lld", (long long) scm_get_int(vm, item));
+      frag.assign(tmp, (size_t) n);
+    } else if (scm_is_float(vm, item)) {
+      frag = redis_scheme_ftoa(scm_get_float(vm, item));
+    } else {
+      continue; /* skip non-scalar fragments */
+    }
+    if (!first) msg += ' ';
+    msg += frag;
+    first = false;
+  }
+
+  static const char *level_names[] = {
+    "debug", "verbose", "notice", "warning"
+  };
+  RedisModule_Log(h->ctx, level_names[lvl], "%s", msg.c_str());
+  return_void();
+}
+
 /* ---------------------------------------------------------------------------
  * Script cache: sha1 hex -> LRU metadata.  The compiled closure itself
  * lives in the VM registry under "~script:<sha1>", so GC roots it (and
@@ -493,6 +561,7 @@ static const RegCProc redis_scheme_lib[] = {
   RegCProc("redis-call", redis_scheme_stub_call, true),
   RegCProc("redis-pcall", redis_scheme_stub_pcall, true),
   RegCProc("redis-sha1hex", redis_scheme_stub_sha1hex),
+  RegCProc("redis-log", redis_scheme_stub_log, true),
   RegCProc(NULL, -1)               /* end sentinel */
 };
 
@@ -535,6 +604,16 @@ redis_scheme_runtime_init(void)
     scm_registry_set(g_vm->vm, REDIS_SCHEME_CTX_KEY,
         scm_make_lightuserdata(g_vm->vm, g_vm));
     scm_register_lib(g_vm->vm, redis_scheme_lib);
+
+    /* Log-level constants for redis-log, matching Redis's LL_* values. */
+    scm_set_global(g_vm->vm, "redis-log-debug",
+                   scm_make_int(g_vm->vm, REDIS_SCHEME_LOG_DEBUG));
+    scm_set_global(g_vm->vm, "redis-log-verbose",
+                   scm_make_int(g_vm->vm, REDIS_SCHEME_LOG_VERBOSE));
+    scm_set_global(g_vm->vm, "redis-log-notice",
+                   scm_make_int(g_vm->vm, REDIS_SCHEME_LOG_NOTICE));
+    scm_set_global(g_vm->vm, "redis-log-warning",
+                   scm_make_int(g_vm->vm, REDIS_SCHEME_LOG_WARNING));
   }
   catch (...) {
     redis_scheme_free_gvm();
