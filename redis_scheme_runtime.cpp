@@ -970,6 +970,16 @@ redis_scheme_run_cached(RedisModuleCtx *ctx, const char *sha1hex,
     return -1;
   }
 
+  /* Seed the RNG from the script sha1 so replicas replay the same random
+     sequence as the master.  The first 16 hex chars give a 64-bit seed. */
+  scm_uint seed = 0;
+  for (int i = 0; i < 16; i++) {
+    char c = sha1hex[i];
+    int v = (c >= '0' && c <= '9') ? (c - '0') : (c - 'a' + 10);
+    seed = (seed << 4) | (scm_uint) v;
+  }
+  G(vm)->randstate = seed;
+
   /* Pull the compiled closure out of the registry and apply it.  The
      registry itself is GC-rooted, so the closure needs no extra slot;
      out_slot must be rooted because it holds scm_apply's return value
