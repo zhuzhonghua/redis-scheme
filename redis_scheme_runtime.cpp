@@ -614,6 +614,17 @@ redis_scheme_runtime_init(void)
                    scm_make_int(g_vm->vm, REDIS_SCHEME_LOG_NOTICE));
     scm_set_global(g_vm->vm, "redis-log-warning",
                    scm_make_int(g_vm->vm, REDIS_SCHEME_LOG_WARNING));
+
+    /* Server version constants.  GetServerVersion returns the packed
+     * hex-format number (major<<16 | minor<<8 | patch), same as
+     * REDIS_VERSION_NUM. */
+    int ver = RedisModule_GetServerVersion();
+    scm_set_global(g_vm->vm, "redis-version-num", scm_make_int(g_vm->vm, ver));
+    char ver_str[32] = {0};
+    int ver_len = snprintf(ver_str, sizeof(ver_str), "%d.%d.%d",
+                           (ver >> 16) & 0xff, (ver >> 8) & 0xff, ver & 0xff);
+    scm_set_global(g_vm->vm, "redis-version",
+                   scm_make_string(g_vm->vm, ver_str, ver_len));
   }
   catch (...) {
     redis_scheme_free_gvm();
