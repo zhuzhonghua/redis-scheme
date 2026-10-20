@@ -565,6 +565,34 @@ static const RegCProc redis_scheme_lib[] = {
   RegCProc(NULL, -1)               /* end sentinel */
 };
 
+/* Strip file/IO builtins from genv so scripts cannot read or write the
+   server filesystem.  Each name is overwritten with #f; calling it from a
+   script raises "not a procedure". */
+static void
+redis_scheme_sandbox_strip(VM *vm)
+{
+  static const char *unsafe_names[] = {
+    /* file ports */
+    "open-input-file", "open-output-file",
+    "close-input-port", "close-output-port",
+    /* IO operations */
+    "read", "read-char", "peek-char",
+    "write", "write-char", "display", "newline",
+    /* port management */
+    "flush-output", "flush-output-port",
+    "current-input-port", "current-output-port",
+    /* file loading */
+    "load",
+    /* port type predicates */
+    "input-port?", "output-port?", "port?",
+    "eof-object?", "char-ready?",
+    NULL
+  };
+  for (int i = 0; unsafe_names[i] != NULL; i++) {
+    scm_set_global(vm, unsafe_names[i], scm_make_bool(vm, false));
+  }
+}
+
 /* Release g_vm and its VM.  Used on init failure and on runtime_done. */
 static void
 redis_scheme_free_gvm(void)
@@ -625,6 +653,9 @@ redis_scheme_runtime_init(void)
                            (ver >> 16) & 0xff, (ver >> 8) & 0xff, ver & 0xff);
     scm_set_global(g_vm->vm, "redis-version",
                    scm_make_string(g_vm->vm, ver_str, ver_len));
+
+    /* Strip file/IO builtins from genv. */
+    redis_scheme_sandbox_strip(g_vm->vm);
   }
   catch (...) {
     redis_scheme_free_gvm();
