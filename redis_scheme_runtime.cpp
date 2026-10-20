@@ -978,7 +978,7 @@ redis_scheme_run_cached(RedisModuleCtx *ctx, const char *sha1hex,
     int v = (c >= '0' && c <= '9') ? (c - '0') : (c - 'a' + 10);
     seed = (seed << 4) | (scm_uint) v;
   }
-  G(vm)->randstate = seed;
+  scm_set_rng_seed(vm, seed);
 
   /* Pull the compiled closure out of the registry and apply it.  The
      registry itself is GC-rooted, so the closure needs no extra slot;
