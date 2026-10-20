@@ -18,13 +18,20 @@ keystep=1), so key parsing and cluster routing follow the same rules.
 
 ## Build
 
-`SCHEME_SRC_DIR` must point at the host dummyscheme project (the scheme
-core sources).
+Clone both repos side by side and build — run the whole block top to
+bottom, no further setup needed:
 
 ```
-cmake -S . -B build -DSCHEME_SRC_DIR=/path/to/dummy
+git clone --depth=1 https://github.com/zhuzhonghua/dummyscheme
+git clone --depth=1 https://github.com/zhuzhonghua/redis-scheme
+cd redis-scheme
+cmake -S . -B build -DSCHEME_SRC_DIR=../dummyscheme
 cmake --build build -j8
 ```
+
+`SCHEME_SRC_DIR` points at the host dummyscheme project (the scheme core
+sources); `../dummyscheme` matches the two clones sitting next to each
+other, and it is also the default when building in a checkout.
 
 ## How to use
 
