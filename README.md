@@ -175,3 +175,49 @@ redis-cli SCHEME.EVAL '(redis-sha1hex "abc")' 0
 
 Returns `a9993e364706816aba3e25717850c26c9cd0d89d`.  Passing any other
 type is an error.
+
+## Logging
+
+`redis-log` writes a message to the Redis server log.  The first argument
+is the log level (one of the constants below), the rest are message
+fragments joined with spaces.  Only strings and numbers contribute;
+other types are skipped.
+
+```
+redis-cli SCHEME.EVAL '(redis-log redis-log-warning "cache miss for" key)' 1 mykey
+redis-cli SCHEME.EVAL '(redis-log redis-log-notice "script started")' 0
+```
+
+Constants: `redis-log-debug`=0, `redis-log-verbose`=1, `redis-log-notice`=2,
+`redis-log-warning`=3.
+
+## Propagation control
+
+By default every write a script issues is propagated to AOF and replicas.
+`redis-set-repl` turns propagation on or off for the rest of the script:
+
+```
+redis-cli SCHEME.EVAL '(begin
+  (redis-call "SET" "visible" 1)          ; propagated
+  (redis-set-repl redis-repl-none)
+  (redis-call "SET" "temp-counter" 99)    ; NOT propagated
+  (redis-set-repl redis-repl-all)
+  (redis-call "SET" "visible-again" 1)    ; propagated again
+)' 0
+```
+
+Constants: `redis-repl-none`=0, `redis-repl-aof`=1, `redis-repl-replica`=2,
+`redis-repl-all`=3.  The flags reset to `all` at the start of every script
+invocation, so settings do not leak between scripts.
+
+Note: the module API controls AOF and replica propagation together; there
+is no way to enable one without the other.
+
+## Server version
+
+Two globals expose the running server version:
+
+```
+redis-cli SCHEME.EVAL 'redis-version' 0        ; "8.10.2"
+redis-cli SCHEME.EVAL 'redis-version-num' 0     ; 526850 (0x00080a02)
+```

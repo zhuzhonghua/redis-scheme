@@ -43,11 +43,21 @@ enum {
   REDIS_SCHEME_LOG_WARNING = 3
 };
 
+/* Replication propagation flags, matching Redis server.h's PROPAGATE_*:
+ * NONE=0, AOF=1, REPL=2.  The "!" flag in RedisModule_Call enables both
+ * AOF and REPL together; there is no per-channel control in the module API. */
+enum {
+  REDIS_SCHEME_PROPAGATE_NONE = 0,
+  REDIS_SCHEME_PROPAGATE_AOF = 1,
+  REDIS_SCHEME_PROPAGATE_REPL = 2
+};
+
 struct redis_scheme_vm_s {
   VM *vm;               /* interpreter (created once by runtime_init) */
   RedisModuleCtx *ctx;  /* ctx of the current command (set before apply) */
   char *errbuf;         /* most recent error message (owned) */
   int   errcap;
+  int   repl_flags;     /* propagation flags for redis-call (reset per request) */
 };
 
 typedef struct redis_scheme_vm_s redis_scheme_vm_t;
@@ -334,12 +344,13 @@ redis_scheme_do_call(VM *vm, ValueT *rest, bool raise)
     }
   } args_guard = { h->ctx, &args };
 
-  /* "v!SE": v = the args vector, ! = replicate write commands to AOF /
-     replicas, S = script mode (reject deny-script commands), E = dispatch
-     failures come back as error replies instead of NULL + errno, so both
-     kinds of failure look alike. */
+  /* "vSE" always; "!" enables replication of write commands to AOF/replicas.
+     redis-set-repl can turn it off per-script.  S = script mode (reject
+     deny-script commands), E = dispatch failures come back as error replies. */
+  const char *fmt = (h->repl_flags != REDIS_SCHEME_PROPAGATE_NONE)
+                      ? "v!SE" : "vSE";
   RedisModuleCallReply *reply = RedisModule_Call(h->ctx, cmdname.c_str(),
-                                                 "v!SE", args.data(),
+                                                 fmt, args.data(),
                                                  args.size());
   if (reply == NULL) {
     redis_scheme_throw_err(h, "redis-call: command '%s' failed",
@@ -497,6 +508,26 @@ redis_scheme_stub_log(VM* vm, ValueT* rest)
   return_void();
 }
 
+/* redis-set-repl: set propagation flags for subsequent redis-call in this
+   script invocation.  Argument is a bitmask of redis-repl-none/aof/replica/all. */
+static ValueT
+redis_scheme_stub_set_repl(VM* vm, ValueT* flags)
+{
+  redis_scheme_vm_t *h = redis_scheme_get_ctx(vm);
+  if (!scm_is_int(vm, flags)) {
+    redis_scheme_throw_err(h,
+        "redis-set-repl: flags must be an integer, got %s",
+        scm_typename(vm, flags));
+  }
+  int f = (int) scm_get_int(vm, flags);
+  if (f & ~(REDIS_SCHEME_PROPAGATE_AOF | REDIS_SCHEME_PROPAGATE_REPL)) {
+    redis_scheme_throw_err(h,
+        "redis-set-repl: invalid flags %d (use redis-repl-none/aof/replica/all)", f);
+  }
+  h->repl_flags = f;
+  return_void();
+}
+
 /* ---------------------------------------------------------------------------
  * Script cache: sha1 hex -> LRU metadata.  The compiled closure itself
  * lives in the VM registry under "~script:<sha1>", so GC roots it (and
@@ -562,6 +593,7 @@ static const RegCProc redis_scheme_lib[] = {
   RegCProc("redis-pcall", redis_scheme_stub_pcall, true),
   RegCProc("redis-sha1hex", redis_scheme_stub_sha1hex),
   RegCProc("redis-log", redis_scheme_stub_log, true),
+  RegCProc("redis-set-repl", redis_scheme_stub_set_repl),
   RegCProc(NULL, -1)               /* end sentinel */
 };
 
@@ -619,6 +651,7 @@ redis_scheme_runtime_init(void)
   g_vm->ctx = NULL;
   g_vm->errbuf = NULL;
   g_vm->errcap = 0;
+  g_vm->repl_flags = REDIS_SCHEME_PROPAGATE_AOF | REDIS_SCHEME_PROPAGATE_REPL;
 
   try {
     g_vm->vm = scm_create_vm(redis_scheme_alloc, NULL);
@@ -653,6 +686,17 @@ redis_scheme_runtime_init(void)
                            (ver >> 16) & 0xff, (ver >> 8) & 0xff, ver & 0xff);
     scm_set_global(g_vm->vm, "redis-version",
                    scm_make_string(g_vm->vm, ver_str, ver_len));
+
+    /* Replication propagation constants for redis-set-repl. */
+    scm_set_global(g_vm->vm, "redis-repl-none",
+                   scm_make_int(g_vm->vm, REDIS_SCHEME_PROPAGATE_NONE));
+    scm_set_global(g_vm->vm, "redis-repl-aof",
+                   scm_make_int(g_vm->vm, REDIS_SCHEME_PROPAGATE_AOF));
+    scm_set_global(g_vm->vm, "redis-repl-replica",
+                   scm_make_int(g_vm->vm, REDIS_SCHEME_PROPAGATE_REPL));
+    scm_set_global(g_vm->vm, "redis-repl-all",
+                   scm_make_int(g_vm->vm,
+                       REDIS_SCHEME_PROPAGATE_AOF | REDIS_SCHEME_PROPAGATE_REPL));
 
     /* Strip file/IO builtins from genv. */
     redis_scheme_sandbox_strip(g_vm->vm);
@@ -909,6 +953,7 @@ redis_scheme_run_cached(RedisModuleCtx *ctx, const char *sha1hex,
   if (g_vm->errbuf != NULL) {
     g_vm->errbuf[0] = '\0';
   }
+  g_vm->repl_flags = REDIS_SCHEME_PROPAGATE_AOF | REDIS_SCHEME_PROPAGATE_REPL;
 
   /* Bind KEYS/ARGV on genv for this request. */
   try {
