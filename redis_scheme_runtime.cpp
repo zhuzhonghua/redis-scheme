@@ -1,8 +1,10 @@
 /*
  * redis_scheme_runtime.cpp -- C bridge over the dummyscheme VM.
  *
- * create/destroy a VM, evaluate a script, reply with the result rendered as a string.
- *
+ * The VM is a process-lifetime singleton.  Each cached script compiles into a
+ * closure bound to a fresh sandbox env (hashtable with metatable {__index =
+ * genv}), and lives in the VM registry.  Per request we only bind KEYS/ARGV on
+ * genv and apply the cached closure.
  */
 #include "vm.h"
 #include "redis_scheme_runtime.h"
@@ -27,18 +29,25 @@ using namespace Scheme;
 /* Registry keys */
 #define REDIS_SCHEME_CTX_KEY "~redis-scheme-ctx"
 #define REDIS_SCHEME_LAST_KEY "~redis-scheme-last"
+/* Registry slot prefix for compiled script closures; the full key is
+ * "~script:<sha1hex>" (40 hex chars). */
+#define REDIS_SCHEME_SCRIPT_KEY_PREFIX "~script:"
 
 struct redis_scheme_vm_s {
-  VM *vm;               /* interpreter (created by scm_create_vm) */
-  RedisModuleCtx *ctx;  /* ctx of the current command (set at eval, used at reply) */
+  VM *vm;               /* interpreter (created once by runtime_init) */
+  RedisModuleCtx *ctx;  /* ctx of the current command (set before apply) */
   char *errbuf;         /* most recent error message (owned) */
   int   errcap;
 };
 
+typedef struct redis_scheme_vm_s redis_scheme_vm_t;
+
+/* The long-lived VM handle.  Created in redis_scheme_runtime_init, never
+ * recreated per request. */
+static redis_scheme_vm_t *g_vm = NULL;
+
 /* ---------------------------------------------------------------------------
- * Host functions -- the functions callable from scheme scripts.  The
- * helpers below (get_ctx / throw_err / reply_tagged) support them; register
- * new functions in redis_scheme_lib, keeping the (NULL, -1) sentinel last.
+ * Error plumbing shared by host functions and the run path.
  * ------------------------------------------------------------------------ */
 
 /* Resolve the command handle stored in the VM registry. */
@@ -52,7 +61,7 @@ redis_scheme_get_ctx(VM *vm)
   return (redis_scheme_vm_t *) scm_to_lightuserdata(vm, &ctx);
 }
 
-/* Fill the handle's error buffer and throw it.  The eval wrapper prefers
+/* Fill the handle's error buffer and throw it.  The apply wrapper prefers
    h->errbuf over the thrown string, so the message reaches the client
    as-is. */
 static void
@@ -197,8 +206,7 @@ redis_scheme_parse_reply(redis_scheme_vm_t *h, RedisModuleCallReply *reply)
   }
   case REDISMODULE_REPLY_VERBATIM_STRING: {
     size_t len = 0;
-    const char *format = NULL;
-    const char *s = RedisModule_CallReplyVerbatim(reply, &len, &format);
+    const char *s = RedisModule_CallReplyVerbatim(reply, &len, NULL);
     Sgcvar1(vm, str);
     *str = scm_make_string(vm, s != NULL ? s : "", (int) len);
     return *str;
@@ -219,9 +227,8 @@ redis_scheme_parse_reply(redis_scheme_vm_t *h, RedisModuleCallReply *reply)
     return *b;
   }
   case REDISMODULE_REPLY_NULL:
-    /* null replies map to #f: falsy like Lua's nil (scripts test with
-       (if ...)), and returning it produces a null reply -- the same round
-       trip as Lua's nil. */
+    /* null replies map to #f: scripts test with (if ...), and returning
+       it produces a null reply. */
     {
       Sgcvar1(vm, b);
       *b = scm_make_bool(vm, false);
@@ -272,9 +279,9 @@ redis_scheme_parse_reply(redis_scheme_vm_t *h, RedisModuleCallReply *reply)
    arguments (strings, ints and floats, converted to bulk strings).  The
    reply comes back as a scheme value: bulk string -> string, integer ->
    int, double -> float, bool -> #t/#f, null -> #f, array/set -> vector,
-   map -> hashtable, big number / verbatim -> string.  redis-call aborts the
-   script on an error reply; redis-pcall returns a {err=...} table instead.
-   raise selects that error behavior. */
+   map -> hashtable, big number / verbatim -> string.  redis-call aborts
+   the script on an error reply; redis-pcall returns a {err=...} table
+   instead.  raise selects that error behavior. */
 static ValueT
 redis_scheme_do_call(VM *vm, ValueT *rest, bool raise)
 {
@@ -317,11 +324,10 @@ redis_scheme_do_call(VM *vm, ValueT *rest, bool raise)
     }
   } args_guard = { h->ctx, &args };
 
-  /* "v!SE": v = the args vector, ! = replicate (propagate write commands
-     to AOF / replicas, like EVAL's effect replication), S = script mode
-     (reject deny-script commands), E = dispatch failures come back as
-     error replies instead of NULL + errno, so both kinds of failure look
-     alike. */
+  /* "v!SE": v = the args vector, ! = replicate write commands to AOF /
+     replicas, S = script mode (reject deny-script commands), E = dispatch
+     failures come back as error replies instead of NULL + errno, so both
+     kinds of failure look alike. */
   RedisModuleCallReply *reply = RedisModule_Call(h->ctx, cmdname.c_str(),
                                                  "v!SE", args.data(),
                                                  args.size());
@@ -423,15 +429,16 @@ redis_scheme_stub_sha1hex(VM* vm, ValueT* arg)
   return *slot;
 }
 
-/* Script cache: sha1 hex -> script body, process-lifetime (dropped on
-   restart).  Single-threaded command execution, no locking.
-   Eviction: only EVAL-sourced entries are evictable, least-recently-used
-   first, when their count reaches REDIS_SCHEME_SCRIPT_LRU_MAX; LOAD-sourced
-   entries are never evicted. */
+/* ---------------------------------------------------------------------------
+ * Script cache: sha1 hex -> LRU metadata.  The compiled closure itself
+ * lives in the VM registry under "~script:<sha1>", so GC roots it (and
+ * transitively its sandbox env, lambda, constants).  The C++ map only
+ * tracks presence and eviction order.  Single-threaded command execution,
+ * no locking.
+ * ------------------------------------------------------------------------ */
 #define REDIS_SCHEME_SCRIPT_LRU_MAX 500
 
 struct redis_scheme_cache_entry {
-  std::string body;
   int evictable;                         /* EVAL-sourced entries only */
   std::list<std::string>::iterator lru;  /* valid only when evictable */
 };
@@ -452,142 +459,16 @@ redis_scheme_cache_touch(redis_scheme_script_cache_t::iterator it)
   it->second.lru = --redis_scheme_script_lru.end();
 }
 
-void
-redis_scheme_cache_script(const char *body, size_t body_len, char out_sha1[41],
-                          int evictable)
+/* Build the registry slot name "~script:<sha1>". */
+static std::string
+redis_scheme_script_regkey(const char *sha1)
 {
-  redis_scheme_sha1hex_buf(body, body_len, out_sha1);
-  redis_scheme_script_cache_t::iterator it =
-      redis_scheme_script_cache.find(out_sha1);
-  if (it != redis_scheme_script_cache.end()) {
-    redis_scheme_cache_touch(it);
-    return;
-  }
-  if (evictable) {
-    while (redis_scheme_script_lru.size() >= REDIS_SCHEME_SCRIPT_LRU_MAX) {
-      redis_scheme_script_cache.erase(redis_scheme_script_lru.front());
-      redis_scheme_script_lru.pop_front();
-    }
-  }
-  redis_scheme_cache_entry &e = redis_scheme_script_cache[out_sha1];
-  e.body.assign(body, body_len);
-  e.evictable = evictable;
-  if (evictable) {
-    redis_scheme_script_lru.push_back(out_sha1);
-    e.lru = --redis_scheme_script_lru.end();
-  }
+  return std::string(REDIS_SCHEME_SCRIPT_KEY_PREFIX) + sha1;
 }
-
-int
-redis_scheme_cache_has(const char *sha1hex)
-{
-  return redis_scheme_script_cache.count(sha1hex) != 0;
-}
-
-void
-redis_scheme_cache_flush(void)
-{
-  redis_scheme_script_cache.clear();
-  redis_scheme_script_lru.clear();
-}
-
-/* Bind KEYS/ARGV, evaluate, reply, destroy.  The reply and the error
-   handling are the SCHEME.EVAL flow verbatim. */
-static int
-redis_scheme_run_body(RedisModuleCtx *ctx, const char *body, size_t body_len,
-                      RedisModuleString **argv, int argc, long long numkeys)
-{
-  redis_scheme_vm_t *h = redis_scheme_create(ctx);
-  if (h == NULL) {
-    RedisModule_ReplyWithError(ctx, "ERR scheme: cannot create VM");
-    return -1;
-  }
-
-  char errbuf[512];
-  if (redis_scheme_bind_args(h, argv, argc, numkeys,
-                             errbuf, sizeof(errbuf)) != 0) {
-    redis_scheme_destroy(h, NULL, 0);
-    RedisModule_ReplyWithErrorFormat(ctx, "ERR scheme: %s", errbuf);
-    return -1;
-  }
-
-  if (redis_scheme_eval(h, body, body_len, errbuf, sizeof(errbuf)) != 0) {
-    redis_scheme_destroy(h, NULL, 0);
-    RedisModule_ReplyWithErrorFormat(ctx, "ERR scheme: %s", errbuf);
-    return -1;
-  }
-
-  redis_scheme_reply(h, ctx);
-  redis_scheme_destroy(h, NULL, 0);
-  return 0;
-}
-
-int
-redis_scheme_run(RedisModuleCtx *ctx, const char *body, size_t body_len,
-                 RedisModuleString **argv, int argc, long long numkeys)
-{
-  /* The script enters the cache (evictable, LRU) before it runs. */
-  char sha1[41];
-  redis_scheme_cache_script(body, body_len, sha1, 1);
-  return redis_scheme_run_body(ctx, body, body_len, argv, argc, numkeys);
-}
-
-int
-redis_scheme_run_cached(RedisModuleCtx *ctx, const char *sha1hex,
-                        RedisModuleString **argv, int argc, long long numkeys)
-{
-  redis_scheme_script_cache_t::iterator it =
-      redis_scheme_script_cache.find(sha1hex);
-  if (it == redis_scheme_script_cache.end()) {
-    RedisModule_ReplyWithError(ctx,
-        "NOSCRIPT no matching script; use SCHEME.EVAL");
-    return -1;
-  }
-  /* Safe against invalidation: nothing clears the cache while a script
-     runs (SCHEME.SCRIPT / SCHEME.EVALSHA are deny-script for calls from
-     inside a script). */
-  redis_scheme_cache_touch(it);
-  const std::string &body = it->second.body;
-  return redis_scheme_run_body(ctx, body.data(), body.size(),
-                               argv, argc, numkeys);
-}
-
-/* Registration table; keep the (NULL, -1) sentinel last. */
-static const RegCProc redis_scheme_lib[] = {
-  RegCProc("redis-error-reply", redis_scheme_stub_error_reply),
-  RegCProc("redis-status-reply", redis_scheme_stub_status_reply),
-  RegCProc("redis-call", redis_scheme_stub_call, true),
-  RegCProc("redis-pcall", redis_scheme_stub_pcall, true),
-  RegCProc("redis-sha1hex", redis_scheme_stub_sha1hex),
-  RegCProc(NULL, -1)               /* end sentinel */
-};
 
 /* ---------------------------------------------------------------------------
- * C API implementation
+ * VM lifecycle
  * ------------------------------------------------------------------------ */
-
-/* Root v on the value stack, then store it in the registry: the collector
-   only marks stack slots and the registry, so a bare C-local ValueT would
-   not survive a collection inside scm_registry_set. */
-static void redis_registry_set(VM* vm, const char* name, ValueT v)
-{
-  Sgcvar1(vm, slot);
-  *slot = v;
-  scm_registry_set(vm, name, *slot);
-}
-
-/* Translate an exception into the module error contract: fill err with the
-   message, preferring h->errbuf (set by redis_scheme_throw_err) over the
-   thrown string.  The caller returns -1 after calling this. */
-static void
-redis_scheme_fill_err(redis_scheme_vm_t *h, const char *e, char *err, int err_cap)
-{
-  if (err_cap > 0) {
-    const char *msg = (h->errbuf != NULL && h->errbuf[0] != '\0')
-                        ? h->errbuf : (e != NULL ? e : "unknown scheme error");
-    snprintf(err, err_cap, "%s", msg);
-  }
-}
 
 /* Allocator handed to the host VM, so every scheme object lives in Redis
    memory (zmalloc, counted by INFO memory and OOM-checked), the same
@@ -605,162 +486,163 @@ redis_scheme_alloc(void *ud, void *ptr, size_t osize, size_t nsize)
   return RedisModule_Realloc(ptr, nsize);
 }
 
-redis_scheme_vm_t *
-redis_scheme_create(RedisModuleCtx *ctx)
+/* Registration table; keep the (NULL, -1) sentinel last. */
+static const RegCProc redis_scheme_lib[] = {
+  RegCProc("redis-error-reply", redis_scheme_stub_error_reply),
+  RegCProc("redis-status-reply", redis_scheme_stub_status_reply),
+  RegCProc("redis-call", redis_scheme_stub_call, true),
+  RegCProc("redis-pcall", redis_scheme_stub_pcall, true),
+  RegCProc("redis-sha1hex", redis_scheme_stub_sha1hex),
+  RegCProc(NULL, -1)               /* end sentinel */
+};
+
+/* Release g_vm and its VM.  Used on init failure and on runtime_done. */
+static void
+redis_scheme_free_gvm(void)
 {
-  redis_scheme_vm_t *h = (redis_scheme_vm_t *) malloc(sizeof(*h));
-  if (h == NULL) {
-    return NULL;
+  if (g_vm == NULL) return;
+  if (g_vm->vm != NULL) {
+    scm_destroy_vm(g_vm->vm);
   }
-
-  h->vm = NULL;
-  h->ctx = ctx;
-  h->errbuf = NULL;
-  h->errcap = 0;
-
-  try {
-    h->vm = scm_create_vm(redis_scheme_alloc, NULL);
-    if (h->vm == NULL) {
-      free(h);
-      return NULL;
-    }
-    /* Store the handle in the registry so host functions (added later) can
-       find their context. */
-    scm_registry_set(h->vm, REDIS_SCHEME_CTX_KEY,
-        scm_make_lightuserdata(h->vm, h));
-    scm_register_lib(h->vm, redis_scheme_lib);
-  }
-  catch (...) {
-    if (h->vm != NULL) {
-      scm_destroy_vm(h->vm);
-    }
-    free(h);
-    return NULL;
-  }
-
-  return h;
+  free(g_vm->errbuf);
+  free(g_vm);
+  g_vm = NULL;
 }
 
 int
-redis_scheme_destroy(redis_scheme_vm_t *h, char *err, int err_cap)
+redis_scheme_runtime_init(void)
 {
-  /* h is always a non-NULL handle from redis_scheme_create. */
-  if (err_cap > 0) {
-    err[0] = '\0';
+  if (g_vm != NULL) {
+    return 0;
   }
+  g_vm = (redis_scheme_vm_t *) calloc(1, sizeof(*g_vm));
+  if (g_vm == NULL) {
+    return -1;
+  }
+  g_vm->ctx = NULL;
+  g_vm->errbuf = NULL;
+  g_vm->errcap = 0;
 
-  if (h->vm != NULL) {
-    try {
-      scm_destroy_vm(h->vm);
-    }
-    catch (const char *e) {
-      if (err_cap > 0) {
-        snprintf(err, err_cap, "scheme teardown error: %s",
-            e != NULL ? e : "unknown");
-      }
-      free(h->errbuf);
-      free(h);
+  try {
+    g_vm->vm = scm_create_vm(redis_scheme_alloc, NULL);
+    if (g_vm->vm == NULL) {
+      redis_scheme_free_gvm();
       return -1;
     }
-    catch (...) {
-      if (err_cap > 0) {
-        snprintf(err, err_cap, "scheme teardown error: unknown exception");
+    /* Store the handle in the registry so host functions can find their
+       context.  The lightuserdata outlives every command (g_vm is a
+       singleton); host functions read g_vm->ctx for the current command. */
+    scm_registry_set(g_vm->vm, REDIS_SCHEME_CTX_KEY,
+        scm_make_lightuserdata(g_vm->vm, g_vm));
+    scm_register_lib(g_vm->vm, redis_scheme_lib);
+  }
+  catch (...) {
+    redis_scheme_free_gvm();
+    return -1;
+  }
+  return 0;
+}
+
+void
+redis_scheme_runtime_done(void)
+{
+  redis_scheme_script_cache.clear();
+  redis_scheme_script_lru.clear();
+  redis_scheme_free_gvm();
+}
+
+/* ---------------------------------------------------------------------------
+ * Script cache API
+ * ------------------------------------------------------------------------ */
+
+int
+redis_scheme_cache_script(RedisModuleCtx *ctx, const char *body,
+                          size_t body_len, char out_sha1[41], int evictable)
+{
+  redis_scheme_sha1hex_buf(body, body_len, out_sha1);
+
+  redis_scheme_script_cache_t::iterator it =
+      redis_scheme_script_cache.find(out_sha1);
+  if (it != redis_scheme_script_cache.end()) {
+    redis_scheme_cache_touch(it);
+    return 0;
+  }
+
+  VM *vm = g_vm->vm;
+  try {
+    /* Build the sandbox env: a fresh hashtable.  scm_compile installs
+       {__index = genv} on it and compiles the script as a closure whose
+       outers[0] is this env.  Top-level define/set! write into the sandbox;
+       reads miss the sandbox and fall through to genv (builtins, redis-*,
+       KEYS/ARGV). */
+    Sgcvar1(vm, env_slot);
+    *env_slot = scm_make_table(vm);
+
+    Sgcvar1(vm, cl_slot);
+    *cl_slot = scm_compile(vm, env_slot, body, (int) body_len);
+
+    /* Root the closure in the registry under "~script:<sha1>". */
+    std::string regkey = redis_scheme_script_regkey(out_sha1);
+    scm_registry_set(vm, regkey.c_str(), *cl_slot);
+
+    /* LRU eviction of EVAL-sourced entries. */
+    if (evictable) {
+      while (redis_scheme_script_lru.size() >= REDIS_SCHEME_SCRIPT_LRU_MAX) {
+        const std::string &victim = redis_scheme_script_lru.front();
+        std::string vkey = redis_scheme_script_regkey(victim.c_str());
+        scm_registry_unset(vm, vkey.c_str());
+        redis_scheme_script_cache.erase(victim);
+        redis_scheme_script_lru.pop_front();
       }
-      free(h->errbuf);
-      free(h);
-      return -1;
+    }
+
+    redis_scheme_cache_entry &e = redis_scheme_script_cache[out_sha1];
+    e.evictable = evictable;
+    if (evictable) {
+      redis_scheme_script_lru.push_back(out_sha1);
+      e.lru = --redis_scheme_script_lru.end();
     }
   }
-
-  free(h->errbuf);
-  free(h);
-  return 0;
-}
-
-int
-redis_scheme_eval(redis_scheme_vm_t *h, const char *script, size_t script_len,
-                  char *err, int err_cap)
-{
-  if (err_cap > 0) {
-    err[0] = '\0';
-  }
-  if (h->errbuf != NULL) {
-    h->errbuf[0] = '\0';
-  }
-
-  /* Full source = user script + trailing newline (the host lexer rejects
-     #t/#f exactly at EOF). */
-  std::string src(script, script_len);
-  src += '\n';
-
-  try {
-    ValueT res = scm_eval_string(h->vm, src.c_str(), (int) src.size());
-    redis_registry_set(h->vm, REDIS_SCHEME_LAST_KEY, res);
-  }
   catch (const char *e) {
-    redis_scheme_fill_err(h, e, err, err_cap);
+    const char *msg = (g_vm->errbuf != NULL && g_vm->errbuf[0] != '\0')
+                        ? g_vm->errbuf : (e != NULL ? e : "compile error");
+    RedisModule_ReplyWithErrorFormat(ctx, "ERR scheme: %s", msg);
     return -1;
   }
   catch (...) {
-    redis_scheme_fill_err(h, NULL, err, err_cap);
+    RedisModule_ReplyWithError(ctx, "ERR scheme: compile error");
     return -1;
   }
   return 0;
 }
 
 int
-redis_scheme_bind_args(redis_scheme_vm_t *h, RedisModuleString **argv,
-                       int argc, long long numkeys, char *err, int err_cap)
+redis_scheme_cache_has(const char *sha1hex)
 {
-  if (err_cap > 0) {
-    err[0] = '\0';
-  }
-
-  /* The caller (module.c) already validated argc >= 3 + numkeys and
-     numkeys >= 0; only bind the vectors here. */
-  VM *vm = h->vm;
-  try {
-    int nkeys = (int) numkeys;
-    int nargs = argc - 3 - nkeys;
-
-    /* KEYS: vector of the declared keys.  The slot roots the vector across
-       any collection inside scm_make_string/scm_vector_set/scm_set_global. */
-    Sgcvar1(vm, keys_slot);
-    *keys_slot = scm_make_vector(vm, nkeys);
-    for (int i = 0; i < nkeys; i++) {
-      size_t len = 0;
-      const char *p = RedisModule_StringPtrLen(argv[3 + i], &len);
-      scm_vector_set(vm, keys_slot, i, scm_make_string(vm, p, (int) len));
-    }
-    scm_set_global(vm, "KEYS", *keys_slot);
-
-    /* ARGV: vector of the remaining arguments. */
-    Sgcvar1(vm, args_slot);
-    *args_slot = scm_make_vector(vm, nargs);
-    for (int i = 0; i < nargs; i++) {
-      size_t len = 0;
-      const char *p = RedisModule_StringPtrLen(argv[3 + nkeys + i], &len);
-      scm_vector_set(vm, args_slot, i, scm_make_string(vm, p, (int) len));
-    }
-    scm_set_global(vm, "ARGV", *args_slot);
-  }
-  catch (const char *e) {
-    redis_scheme_fill_err(h, e, err, err_cap);
-    return -1;
-  }
-  catch (...) {
-    redis_scheme_fill_err(h, NULL, err, err_cap);
-    return -1;
-  }
-  return 0;
+  return redis_scheme_script_cache.count(sha1hex) != 0;
 }
+
+void
+redis_scheme_cache_flush(void)
+{
+  /* Unroot every closure from the registry so the collector can reclaim
+     the closure, its lambda, its constants, and the sandbox env. */
+  for (auto &kv : redis_scheme_script_cache) {
+    std::string regkey = redis_scheme_script_regkey(kv.first.c_str());
+    scm_registry_unset(g_vm->vm, regkey.c_str());
+  }
+  redis_scheme_script_cache.clear();
+  redis_scheme_script_lru.clear();
+}
+
+/* ---------------------------------------------------------------------------
+ * Reply rendering (used by the run path; reads g_vm directly)
+ * ------------------------------------------------------------------------ */
 
 /* Detect a tagged reply value: a hashtable whose "err" field is a string
    (error reply) or whose "ok" field is a string (status reply); "err" is
    checked first.  Returns 1 for an error reply, 2 for a status reply, 0
-   when the value is anything else (which keeps the write-rendering path).
-   Extra fields do not matter.  last is registry-rooted, so the hashtable
-   survives any allocation. */
+   when the value is anything else (which keeps the write-rendering path). */
 static int
 redis_tagged_reply(VM* vm, ValueT* last)
 {
@@ -784,9 +666,8 @@ redis_tagged_reply(VM* vm, ValueT* last)
 /* Convert one scheme value into a Redis reply: numbers (int and float)
    reply as integers, strings as bulk, #t as integer 1, #f as null, proper
    lists and vectors as arrays with the elements converted recursively.
-   Anything else (plain hashtables, symbols, chars, dotted pairs, ...) keeps
-   the write-rendering path.  slot must be rooted for the duration of the
-   call (the recursion allocates, which may collect). */
+   Anything else (plain hashtables, symbols, chars, dotted pairs, ...)
+   keeps the write-rendering path. */
 static void
 redis_scheme_reply_value(VM *vm, ValueT *slot, RedisModuleCtx *ctx)
 {
@@ -795,7 +676,6 @@ redis_scheme_reply_value(VM *vm, ValueT *slot, RedisModuleCtx *ctx)
     return;
   }
   if (scm_is_float(vm, slot)) {
-    /* floats reply as long long, truncated */
     RedisModule_ReplyWithLongLong(ctx, (long long) scm_get_float(vm, slot));
     return;
   }
@@ -814,16 +694,10 @@ redis_scheme_reply_value(VM *vm, ValueT *slot, RedisModuleCtx *ctx)
     return;
   }
   if (scm_is_list(vm, slot)) {
-    /* scm_is_list counts any pair, so the length check doubles as the
-       proper-list test: scm_proper_list_len returns -1 for a dotted pair,
-       which keeps the write-rendering path below (scm_list_len would
-       throw). */
     int len = scm_proper_list_len(vm, slot);
     if (len >= 0) {
       RedisModule_ReplyWithArray(ctx, len);
       for (int i = 0; i < len; i++) {
-        /* element slot lives inside the rooted list and stays valid across
-           the recursive conversion's allocations */
         redis_scheme_reply_value(vm, scm_list_ref(vm, slot, i), ctx);
       }
       return;
@@ -839,9 +713,7 @@ redis_scheme_reply_value(VM *vm, ValueT *slot, RedisModuleCtx *ctx)
     return;
   }
 
-  /* Fallback: write-rendering (plain hashtables, symbols, chars, ...).  The
-     pointer is only valid until the next scm_tostring call; consume it
-     synchronously. */
+  /* Fallback: write-rendering (plain hashtables, symbols, chars, ...). */
   int n = 0;
   const char *s = scm_tostring(vm, slot, &n);
   if (s == NULL) {
@@ -851,42 +723,138 @@ redis_scheme_reply_value(VM *vm, ValueT *slot, RedisModuleCtx *ctx)
   RedisModule_ReplyWithStringBuffer(ctx, s, (size_t) n);
 }
 
-void
-redis_scheme_reply(redis_scheme_vm_t *h, RedisModuleCtx *ctx)
-{
-  ValueT last = scm_registry_get(h->vm, REDIS_SCHEME_LAST_KEY);
+/* ---------------------------------------------------------------------------
+ * Run path
+ * ------------------------------------------------------------------------ */
 
-  /* Tagged replies first: a hashtable field "err" -> error, "ok" -> status.
-     RedisModule_ReplyWithError / ReplyWithSimpleString need a NUL-terminated
-     buffer, so copy the payload out of the scheme string first. */
-  int tag = redis_tagged_reply(h->vm, &last);
+/* Bind KEYS/ARGV on genv.  The cached closure's sandbox env has
+   {__index = genv}, so the script sees KEYS/ARGV through the metatable.
+   argv follows the EVAL shape. */
+static int
+redis_scheme_bind_args(RedisModuleCtx *ctx, RedisModuleString **argv,
+                       int argc, long long numkeys)
+{
+  (void) ctx;
+  VM *vm = g_vm->vm;
+  int nkeys = (int) numkeys;
+  int nargs = argc - 3 - nkeys;
+
+  Sgcvar1(vm, keys_slot);
+  *keys_slot = scm_make_vector(vm, nkeys);
+  for (int i = 0; i < nkeys; i++) {
+    size_t len = 0;
+    const char *p = RedisModule_StringPtrLen(argv[3 + i], &len);
+    scm_vector_set(vm, keys_slot, i, scm_make_string(vm, p, (int) len));
+  }
+  scm_set_global(vm, "KEYS", *keys_slot);
+
+  Sgcvar1(vm, args_slot);
+  *args_slot = scm_make_vector(vm, nargs);
+  for (int i = 0; i < nargs; i++) {
+    size_t len = 0;
+    const char *p = RedisModule_StringPtrLen(argv[3 + nkeys + i], &len);
+    scm_vector_set(vm, args_slot, i, scm_make_string(vm, p, (int) len));
+  }
+  scm_set_global(vm, "ARGV", *args_slot);
+  return 0;
+}
+
+int
+redis_scheme_run(RedisModuleCtx *ctx, const char *body, size_t body_len,
+                 RedisModuleString **argv, int argc, long long numkeys)
+{
+  char sha1[41];
+  if (redis_scheme_cache_script(ctx, body, body_len, sha1, 1) != 0) {
+    return -1;
+  }
+  return redis_scheme_run_cached(ctx, sha1, argv, argc, numkeys);
+}
+
+int
+redis_scheme_run_cached(RedisModuleCtx *ctx, const char *sha1hex,
+                        RedisModuleString **argv, int argc, long long numkeys)
+{
+  redis_scheme_script_cache_t::iterator it =
+      redis_scheme_script_cache.find(sha1hex);
+  if (it == redis_scheme_script_cache.end()) {
+    RedisModule_ReplyWithError(ctx,
+        "NOSCRIPT no matching script; use SCHEME.EVAL");
+    return -1;
+  }
+  redis_scheme_cache_touch(it);
+
+  VM *vm = g_vm->vm;
+  g_vm->ctx = ctx;
+  if (g_vm->errbuf != NULL) {
+    g_vm->errbuf[0] = '\0';
+  }
+
+  /* Bind KEYS/ARGV on genv for this request. */
+  try {
+    redis_scheme_bind_args(ctx, argv, argc, numkeys);
+  }
+  catch (const char *e) {
+    const char *m = (g_vm->errbuf != NULL && g_vm->errbuf[0] != '\0')
+                      ? g_vm->errbuf : (e != NULL ? e : "bind args error");
+    RedisModule_ReplyWithErrorFormat(ctx, "ERR scheme: %s", m);
+    return -1;
+  }
+  catch (...) {
+    RedisModule_ReplyWithError(ctx, "ERR scheme: bind args error");
+    return -1;
+  }
+
+  /* Pull the compiled closure out of the registry and apply it.  The
+     registry itself is GC-rooted, so the closure needs no extra slot;
+     out_slot must be rooted because it holds scm_apply's return value
+     across the subsequent reply rendering. */
+  std::string regkey = redis_scheme_script_regkey(sha1hex);
+  ValueT closure = scm_registry_get(vm, regkey.c_str());
+  Sgcvar1(vm, out_slot);
+  bool ok = scm_apply(vm, &closure, NULL, 0, out_slot);
+  if (!ok) {
+    /* out_slot holds the error string (pcall CATCH path interns it). */
+    const char *m = "script error";
+    int mlen = 0;
+    if (scm_is_string(vm, out_slot)) {
+      m = scm_get_string(vm, out_slot, &mlen);
+    } else if (g_vm->errbuf != NULL && g_vm->errbuf[0] != '\0') {
+      m = g_vm->errbuf;
+      mlen = (int) strlen(m);
+    }
+    std::string msg(m != NULL ? m : "", (size_t) (mlen > 0 ? mlen : strlen(m != NULL ? m : "")));
+    RedisModule_ReplyWithErrorFormat(ctx, "ERR scheme: %s", msg.c_str());
+    return -1;
+  }
+
+  /* Success: root the result as the last value, then reply. */
+  scm_registry_set(vm, REDIS_SCHEME_LAST_KEY, *out_slot);
+
+  int tag = redis_tagged_reply(vm, out_slot);
   if (tag != 0) {
-    /* fetch the payload -- the single "err"/"ok" field (recognized above) */
-    Sgcvar2(h->vm, key_slot, payload_slot);
+    Sgcvar1(vm, key_slot);
     const char *key_name = (tag == 1) ? "err" : "ok";
     int key_len = (tag == 1) ? 3 : 2;
-    *key_slot = scm_make_string(h->vm, key_name, key_len);
-    *payload_slot = scm_table_ref(h->vm, &last, key_slot);
+    *key_slot = scm_make_string(vm, key_name, key_len);
+    ValueT payload = scm_table_ref(vm, out_slot, key_slot);
     int n = 0;
-    const char *s = scm_get_string(h->vm, payload_slot, &n);
+    const char *s = scm_get_string(vm, &payload, &n);
     std::string body(s != NULL ? s : "", s != NULL ? (size_t) n : 0);
     if (tag == 1) {
       RedisModule_ReplyWithError(ctx, body.c_str());
     } else {
       RedisModule_ReplyWithSimpleString(ctx, body.c_str());
     }
-    return;
+    return 0;
   }
 
-  /* Typed conversion (numbers/strings/bools/lists/vectors); anything else is
-     write-rendered inside.  last is registry-rooted, so the value survives
-     the allocations of the conversion. */
   try {
-    redis_scheme_reply_value(h->vm, &last, ctx);
+    redis_scheme_reply_value(vm, out_slot, ctx);
   }
   catch (...) {
-    const char *msg = (h->errbuf != NULL && h->errbuf[0] != '\0')
-                        ? h->errbuf : "cannot render scheme value";
+    const char *msg = (g_vm->errbuf != NULL && g_vm->errbuf[0] != '\0')
+                        ? g_vm->errbuf : "cannot render scheme value";
     RedisModule_ReplyWithErrorFormat(ctx, "ERR scheme: %s", msg);
   }
+  return 0;
 }

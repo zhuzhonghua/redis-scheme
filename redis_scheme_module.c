@@ -98,7 +98,9 @@ static int script_load_command(RedisModuleCtx *ctx,
   char sha1[41];
   /* evictable=0: LOAD-sourced entries are never evicted.  The cache is
      node-local, so LOAD is not propagated to replicas. */
-  redis_scheme_cache_script(body, body_len, sha1, 0);
+  if (redis_scheme_cache_script(ctx, body, body_len, sha1, 0) != 0) {
+    return REDISMODULE_ERR;
+  }
   return RedisModule_ReplyWithStringBuffer(ctx, sha1, 40);
 }
 
@@ -232,10 +234,9 @@ static int register_evalsha_command(RedisModuleCtx *ctx)
 static int register_script_command(RedisModuleCtx *ctx)
 {
   /* deny-script keeps scripts from calling scheme.script / scheme.evalsha
-     again, like EVAL's NOSCRIPT flag.  Not a keyspace write: the script
-     cache is node-local and LOAD / FLUSH are not propagated, hence no
-     write flag.  allow-stale permits running on a replica whose master
-     link is down. */
+     again.  Not a keyspace write: the script cache is node-local and LOAD /
+     FLUSH are not propagated, hence no write flag.  allow-stale permits
+     running on a replica whose master link is down. */
   if (RedisModule_CreateCommand(ctx, "scheme.script", scheme_script_command,
                                 "deny-script allow-stale", 0, 0, 0)
       == REDISMODULE_ERR) {
@@ -257,10 +258,28 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv,
     return REDISMODULE_ERR;
   }
 
+  /* Create the long-lived scheme VM and register the redis-* host functions. */
+  if (redis_scheme_runtime_init() != 0) {
+    RedisModule_Log(ctx, "warning", "could not initialize scheme runtime");
+    return REDISMODULE_ERR;
+  }
+
   if (register_eval_command(ctx) == REDISMODULE_ERR
       || register_evalsha_command(ctx) == REDISMODULE_ERR
       || register_script_command(ctx) == REDISMODULE_ERR) {
     return REDISMODULE_ERR;
   }
+  return REDISMODULE_OK;
+}
+
+/* Optional unload hook: resolved by dlsym in moduleUnload().  Without it,
+   the VM heap (allocated through RedisModule_Realloc) would leak, because
+   dlclose only unmaps the .so pages -- the pointer in g_vm lives in BSS,
+   which gets unmapped, but the heap it points to stays in the Redis process
+   with no referent left. */
+int RedisModule_OnUnload(RedisModuleCtx *ctx)
+{
+  REDISMODULE_NOT_USED(ctx);
+  redis_scheme_runtime_done();
   return REDISMODULE_OK;
 }
